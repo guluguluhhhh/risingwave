@@ -20,12 +20,12 @@ use risingwave_storage::StateStore;
 use super::ExecutorBuilder;
 use crate::common::table::state_table::StateTable;
 use crate::error::StreamResult;
-use crate::executor::{Executor, GapFillExecuter};
+use crate::executor::{Executor, GapFillExecutor};
 use crate::task::ExecutorParams;
 
-pub struct GapFillExecuterBuilder;
+pub struct GapFillExecutorBuilder;
 
-impl ExecutorBuilder for GapFillExecuterBuilder {
+impl ExecutorBuilder for GapFillExecutorBuilder {
     type Node = GapFillNode;
 
     async fn new_boxed_executor(
@@ -65,7 +65,7 @@ impl ExecutorBuilder for GapFillExecuterBuilder {
             StateTable::from_table_catalog(node.get_state_table().as_ref().unwrap(), store, None)
                 .await;
 
-        let exec = GapFillExecuter::new(
+        let exec = GapFillExecutor::new(
             params.actor_context,
             input,
             params.info.schema.clone(),

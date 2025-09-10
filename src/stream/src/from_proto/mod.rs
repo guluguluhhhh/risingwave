@@ -84,7 +84,7 @@ use self::eowc_over_window::*;
 use self::expand::*;
 use self::filter::*;
 use self::eowc_gap_fill::EowcGapFillExecutorBuilder;
-use self::gap_fill::GapFillExecuterBuilder;
+use self::gap_fill::GapFillExecutorBuilder;
 use self::group_top_n::GroupTopNExecutorBuilder;
 use self::hash_agg::*;
 use self::hash_join::*;
@@ -206,6 +206,6 @@ pub async fn create_executor(
         NodeBody::VectorIndexWrite => VectorIndexWriteExecutorBuilder,
         NodeBody::UpstreamSinkUnion => UpstreamSinkUnionExecutorBuilder,
         NodeBody::EowcGapFill => EowcGapFillExecutorBuilder,
-        NodeBody::GapFill => GapFillExecuterBuilder,
+        NodeBody::GapFill => GapFillExecutorBuilder,
     }
 }

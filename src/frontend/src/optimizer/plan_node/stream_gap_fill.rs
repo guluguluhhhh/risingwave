@@ -18,12 +18,12 @@ use risingwave_pb::stream_plan::stream_node::NodeBody;
 use super::generic::GenericPlanNode;
 use super::utils::TableCatalogBuilder;
 use super::{
-    ExprRewritable, ExprVisitable, PlanBase, PlanRef, PlanTreeNodeUnary, StreamNode, StreamPlanRef,
+    ExprRewritable, ExprVisitable, PlanBase, PlanRef, PlanTreeNodeUnary, Stream, StreamNode,
     generic,
 };
-use crate::TableCatalog;
 use crate::binder::BoundFillStrategy;
 use crate::expr::{Expr, ExprImpl, ExprRewriter, ExprVisitor, InputRef};
+use crate::optimizer::plan_node::stream::StreamPlanNodeMetadata;
 use crate::optimizer::plan_node::utils::impl_distill_by_unit;
 use crate::optimizer::property::Distribution;
 use crate::stream_fragmenter::BuildFragmentGraphState;
@@ -33,11 +33,11 @@ use crate::stream_fragmenter::BuildFragmentGraphState;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StreamGapFill {
     pub base: PlanBase<super::Stream>,
-    core: generic::GapFill<PlanRef>,
+    core: generic::GapFill<PlanRef<Stream>>,
 }
 
 impl StreamGapFill {
-    pub fn new(core: generic::GapFill<PlanRef>) -> Self {
+    pub fn new(core: generic::GapFill<PlanRef<Stream>>) -> Self {
         let input = &core.input;
 
         // Use singleton distribution for normal streaming GapFill.
@@ -46,7 +46,7 @@ impl StreamGapFill {
         let base = PlanBase::new_stream_with_core(
             &core,
             Distribution::Single,
-            input.append_only(),
+            input.stream_kind(),
             false, // does NOT provide EOWC semantics
             input.watermark_columns().clone(),
             input.columns_monotonicity().clone(),
@@ -56,7 +56,7 @@ impl StreamGapFill {
 
     // Legacy constructor for backward compatibility
     pub fn new_with_args(
-        input: PlanRef,
+        input: PlanRef<Stream>,
         time_col: InputRef,
         interval: ExprImpl,
         fill_strategies: Vec<BoundFillStrategy>,
@@ -82,7 +82,7 @@ impl StreamGapFill {
         &self.core.fill_strategies
     }
 
-    fn infer_state_table(&self) -> TableCatalog {
+    fn infer_state_table(&self) -> crate::TableCatalog {
         let mut tbl_builder = TableCatalogBuilder::default();
 
         let out_schema = self.core.schema();
@@ -99,19 +99,19 @@ impl StreamGapFill {
     }
 }
 
-impl PlanTreeNodeUnary for StreamGapFill {
-    fn input(&self) -> PlanRef {
+impl PlanTreeNodeUnary<Stream> for StreamGapFill {
+    fn input(&self) -> PlanRef<Stream> {
         self.core.input.clone()
     }
 
-    fn clone_with_input(&self, input: PlanRef) -> Self {
+    fn clone_with_input(&self, input: PlanRef<Stream>) -> Self {
         let mut core = self.core.clone();
         core.input = input;
         Self::new(core)
     }
 }
 
-impl_plan_tree_node_for_unary! { StreamGapFill }
+impl_plan_tree_node_for_unary! { Stream, StreamGapFill }
 impl_distill_by_unit!(StreamGapFill, core, "StreamGapFill");
 
 impl StreamNode for StreamGapFill {
@@ -147,12 +147,12 @@ impl StreamNode for StreamGapFill {
     }
 }
 
-impl ExprRewritable for StreamGapFill {
+impl ExprRewritable<Stream> for StreamGapFill {
     fn has_rewritable_expr(&self) -> bool {
         true
     }
 
-    fn rewrite_exprs(&self, r: &mut dyn ExprRewriter) -> PlanRef {
+    fn rewrite_exprs(&self, r: &mut dyn ExprRewriter) -> PlanRef<Stream> {
         let mut core = self.core.clone();
         core.rewrite_exprs(r);
         Self {

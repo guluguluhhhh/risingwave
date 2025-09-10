@@ -18,12 +18,13 @@ use risingwave_pb::stream_plan::stream_node::NodeBody;
 use super::generic::GenericPlanNode;
 use super::utils::TableCatalogBuilder;
 use super::{
-    ExprRewritable, ExprVisitable, PlanBase, PlanRef, PlanTreeNodeUnary, StreamNode, StreamPlanRef,
+    ExprRewritable, ExprVisitable, PlanBase, PlanRef, PlanTreeNodeUnary, Stream, StreamNode,
     generic,
 };
 use crate::TableCatalog;
 use crate::binder::BoundFillStrategy;
 use crate::expr::{Expr, ExprImpl, ExprRewriter, ExprVisitor, InputRef};
+use crate::optimizer::plan_node::stream::StreamPlanNodeMetadata;
 use crate::optimizer::plan_node::utils::impl_distill_by_unit;
 use crate::optimizer::property::Distribution;
 use crate::stream_fragmenter::BuildFragmentGraphState;
@@ -33,11 +34,11 @@ use crate::stream_fragmenter::BuildFragmentGraphState;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StreamEowcGapFill {
     pub base: PlanBase<super::Stream>,
-    core: generic::GapFill<PlanRef>,
+    core: generic::GapFill<PlanRef<Stream>>,
 }
 
 impl StreamEowcGapFill {
-    pub fn new(core: generic::GapFill<PlanRef>) -> Self {
+    pub fn new(core: generic::GapFill<PlanRef<Stream>>) -> Self {
         let input = &core.input;
 
         // Force singleton distribution for GapFill operations.
@@ -45,7 +46,7 @@ impl StreamEowcGapFill {
         let base = PlanBase::new_stream_with_core(
             &core,
             Distribution::Single,
-            input.append_only(),
+            input.stream_kind(),
             true, // provides EOWC semantics
             input.watermark_columns().clone(),
             input.columns_monotonicity().clone(),
@@ -55,7 +56,7 @@ impl StreamEowcGapFill {
 
     // Legacy constructor for backward compatibility
     pub fn new_with_args(
-        input: PlanRef,
+        input: PlanRef<Stream>,
         time_col: InputRef,
         interval: ExprImpl,
         fill_strategies: Vec<BoundFillStrategy>,
@@ -111,19 +112,19 @@ impl StreamEowcGapFill {
     }
 }
 
-impl PlanTreeNodeUnary for StreamEowcGapFill {
-    fn input(&self) -> PlanRef {
+impl PlanTreeNodeUnary<Stream> for StreamEowcGapFill {
+    fn input(&self) -> PlanRef<Stream> {
         self.core.input.clone()
     }
 
-    fn clone_with_input(&self, input: PlanRef) -> Self {
+    fn clone_with_input(&self, input: PlanRef<Stream>) -> Self {
         let mut core = self.core.clone();
         core.input = input;
         Self::new(core)
     }
 }
 
-impl_plan_tree_node_for_unary! { StreamEowcGapFill }
+impl_plan_tree_node_for_unary! { Stream, StreamEowcGapFill }
 impl_distill_by_unit!(StreamEowcGapFill, core, "StreamEowcGapFill");
 
 impl StreamNode for StreamEowcGapFill {
@@ -150,7 +151,7 @@ impl StreamNode for StreamEowcGapFill {
             .with_id(state.gen_table_id_wrapped())
             .to_internal_table_prost();
 
-        NodeBody::EowcGapFill(Box::new(EowcGapFillNode {
+        NodeBody::EowcGapFill(EowcGapFillNode {
             time_column_index: self.time_col().index() as u32,
             interval: Some(self.interval().to_expr_proto()),
             fill_columns: self
@@ -161,17 +162,16 @@ impl StreamNode for StreamEowcGapFill {
             fill_strategies,
             buffer_table: Some(buffer_table),
             prev_row_table: Some(prev_row_table),
-        }))
+        })
     }
-
 }
 
-impl ExprRewritable for StreamEowcGapFill {
+impl ExprRewritable<Stream> for StreamEowcGapFill {
     fn has_rewritable_expr(&self) -> bool {
         true
     }
 
-    fn rewrite_exprs(&self, r: &mut dyn ExprRewriter) -> PlanRef {
+    fn rewrite_exprs(&self, r: &mut dyn ExprRewriter) -> PlanRef<Stream> {
         let mut core = self.core.clone();
         core.rewrite_exprs(r);
         Self {

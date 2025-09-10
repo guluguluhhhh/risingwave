@@ -20,7 +20,7 @@ use risingwave_pb::stream_plan::EowcGapFillNode;
 use risingwave_storage::StateStore;
 
 use super::ExecutorBuilder;
-use crate::common::table::state_table::StateTable;
+use crate::common::table::state_table::StateTableBuilder;
 use crate::error::StreamResult;
 use crate::executor::Executor;
 use crate::executor::eowc::{EowcGapFillExecutor, EowcGapFillExecutorArgs};
@@ -66,19 +66,20 @@ impl ExecutorBuilder for EowcGapFillExecutorBuilder {
 
         let vnodes = params.vnode_bitmap.map(|bitmap| Arc::new(bitmap));
 
-        let buffer_table = StateTable::from_table_catalog(
+        let buffer_table = StateTableBuilder::new(
             node.get_buffer_table().as_ref().unwrap(),
             store.clone(),
             vnodes.clone(),
         )
+        .forbid_preload_all_rows()
+        .build()
         .await;
 
-        let prev_row_table = StateTable::from_table_catalog(
-            node.get_prev_row_table().as_ref().unwrap(),
-            store,
-            vnodes,
-        )
-        .await;
+        let prev_row_table =
+            StateTableBuilder::new(node.get_prev_row_table().as_ref().unwrap(), store, vnodes)
+                .forbid_preload_all_rows()
+                .build()
+                .await;
 
         let exec = EowcGapFillExecutor::new(EowcGapFillExecutorArgs {
             actor_ctx: params.actor_context,

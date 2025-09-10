@@ -1034,12 +1034,12 @@ mod stream_dedup;
 mod stream_delta_join;
 mod stream_dml;
 mod stream_dynamic_filter;
+mod stream_eowc_gap_fill;
 mod stream_eowc_over_window;
 mod stream_exchange;
 mod stream_expand;
 mod stream_filter;
 mod stream_fs_fetch;
-mod stream_eowc_gap_fill;
 mod stream_gap_fill;
 mod stream_global_approx_percentile;
 mod stream_group_topn;
@@ -1086,7 +1086,6 @@ mod logical_vector_search;
 mod stream_cdc_table_scan;
 mod stream_share;
 mod stream_temporal_join;
-mod stream_union;
 mod stream_upstream_sink_union;
 mod stream_vector_index_write;
 pub mod utils;
@@ -1170,12 +1169,12 @@ pub use stream_dedup::StreamDedup;
 pub use stream_delta_join::StreamDeltaJoin;
 pub use stream_dml::StreamDml;
 pub use stream_dynamic_filter::StreamDynamicFilter;
+pub use stream_eowc_gap_fill::StreamEowcGapFill;
 pub use stream_eowc_over_window::StreamEowcOverWindow;
 pub use stream_exchange::StreamExchange;
 pub use stream_expand::StreamExpand;
 pub use stream_filter::StreamFilter;
 pub use stream_fs_fetch::StreamFsFetch;
-pub use stream_eowc_gap_fill::StreamEowcGapFill;
 pub use stream_gap_fill::StreamGapFill;
 pub use stream_global_approx_percentile::StreamGlobalApproxPercentile;
 pub use stream_group_topn::StreamGroupTopN;
@@ -1270,6 +1269,8 @@ macro_rules! for_all_plan_nodes {
             , { Logical, FileScan }
             , { Logical, PostgresQuery }
             , { Logical, MySqlQuery }
+            , { Logical, GapFill }
+            , { Logical, VectorSearch }
             , { Batch, SimpleAgg }
             , { Batch, HashAgg }
             , { Batch, SortAgg }

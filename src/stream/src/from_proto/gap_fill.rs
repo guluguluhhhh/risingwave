@@ -18,7 +18,7 @@ use risingwave_pb::stream_plan::GapFillNode;
 use risingwave_storage::StateStore;
 
 use super::ExecutorBuilder;
-use crate::common::table::state_table::StateTable;
+use crate::common::table::state_table::StateTableBuilder;
 use crate::error::StreamResult;
 use crate::executor::{Executor, GapFillExecutor};
 use crate::task::ExecutorParams;
@@ -62,7 +62,9 @@ impl ExecutorBuilder for GapFillExecutorBuilder {
             fill_columns.into_iter().zip(fill_strategies).collect();
 
         let state_table =
-            StateTable::from_table_catalog(node.get_state_table().as_ref().unwrap(), store, None)
+            StateTableBuilder::new(node.get_state_table().as_ref().unwrap(), store, None)
+                .forbid_preload_all_rows()
+                .build()
                 .await;
 
         let exec = GapFillExecutor::new(

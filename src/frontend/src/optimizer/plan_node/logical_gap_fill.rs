@@ -15,9 +15,9 @@
 // Minimal imports for prototype
 
 use super::{
-    ColPrunable, ColumnPruningContext, ExprRewritable, ExprVisitable, LogicalFilter, PlanBase,
-    PlanRef, PlanTreeNodeUnary, PredicatePushdown, PredicatePushdownContext, ToBatch, ToStream,
-    ToStreamContext, generic,
+    ColPrunable, ColumnPruningContext, ExprRewritable, ExprVisitable, Logical, LogicalFilter,
+    LogicalPlanRef as PlanRef, PlanBase, PlanTreeNodeUnary, PredicatePushdown,
+    PredicatePushdownContext, ToBatch, ToStream, ToStreamContext, generic,
 };
 use crate::binder::BoundFillStrategy;
 use crate::error::Result;
@@ -63,7 +63,7 @@ impl LogicalGapFill {
     }
 }
 
-impl PlanTreeNodeUnary for LogicalGapFill {
+impl PlanTreeNodeUnary<Logical> for LogicalGapFill {
     fn input(&self) -> PlanRef {
         self.core.input.clone()
     }
@@ -78,7 +78,7 @@ impl PlanTreeNodeUnary for LogicalGapFill {
     }
 }
 
-impl_plan_tree_node_for_unary! { LogicalGapFill }
+impl_plan_tree_node_for_unary! { Logical, LogicalGapFill }
 impl_distill_by_unit!(LogicalGapFill, core, "LogicalGapFill");
 
 impl ColPrunable for LogicalGapFill {
@@ -89,7 +89,7 @@ impl ColPrunable for LogicalGapFill {
     }
 }
 
-impl ExprRewritable for LogicalGapFill {
+impl ExprRewritable<Logical> for LogicalGapFill {
     fn has_rewritable_expr(&self) -> bool {
         true
     }
@@ -98,14 +98,18 @@ impl ExprRewritable for LogicalGapFill {
         let mut core = self.core.clone();
         core.rewrite_exprs(r);
         Self {
-            base: self.base.clone_with_new_plan_id(),
+            base: self.base.clone(),
             core,
         }
         .into()
     }
 }
 
-impl ExprVisitable for LogicalGapFill {}
+impl ExprVisitable for LogicalGapFill {
+    fn visit_exprs(&self, v: &mut dyn crate::expr::ExprVisitor) {
+        self.core.visit_exprs(v);
+    }
+}
 
 impl PredicatePushdown for LogicalGapFill {
     fn predicate_pushdown(
@@ -118,38 +122,32 @@ impl PredicatePushdown for LogicalGapFill {
 }
 
 impl ToBatch for LogicalGapFill {
-    fn to_batch(&self) -> Result<PlanRef> {
+    fn to_batch(&self) -> Result<super::BatchPlanRef> {
         unimplemented!("batch gap fill")
     }
 }
 
 impl ToStream for LogicalGapFill {
-    fn to_stream(&self, ctx: &mut ToStreamContext) -> Result<PlanRef> {
+    fn to_stream(&self, ctx: &mut ToStreamContext) -> Result<super::StreamPlanRef> {
         use super::{StreamEowcGapFill, StreamGapFill};
         use crate::optimizer::property::RequiredDist;
 
         let stream_input = self.input().to_stream(ctx)?;
 
-        if ctx.emit_on_window_close() {
-            // EOWC GapFill always uses singleton distribution for correctness
-            let new_input = RequiredDist::single().enforce_if_not_satisfies(
-                stream_input,
-                &crate::optimizer::property::Order::any(),
-            )?;
+        // GapFill (both normal and EOWC) always uses singleton distribution for correctness.
+        // It needs to see complete time series data to identify and fill gaps properly.
+        let new_input = RequiredDist::single().streaming_enforce_if_not_satisfies(stream_input)?;
 
-            let mut core = self.core.clone();
-            core.input = new_input;
+        let core = generic::GapFill {
+            input: new_input,
+            time_col: self.core.time_col.clone(),
+            interval: self.core.interval.clone(),
+            fill_strategies: self.core.fill_strategies.clone(),
+        };
+
+        if ctx.emit_on_window_close() {
             Ok(StreamEowcGapFill::new(core).into())
         } else {
-            // Normal streaming GapFill also requires singleton distribution for correctness
-            // Gap filling needs to see complete time series data to identify and fill gaps properly
-            let new_input = RequiredDist::single().enforce_if_not_satisfies(
-                stream_input,
-                &crate::optimizer::property::Order::any(),
-            )?;
-
-            let mut core = self.core.clone();
-            core.input = new_input;
             Ok(StreamGapFill::new(core).into())
         }
     }

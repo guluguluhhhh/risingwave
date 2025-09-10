@@ -348,7 +348,7 @@ impl Scheduler {
                     }
                     NodeBody::GapFill(node) => {
                         // GapFill node uses buffer_table for vnode count requirement
-                        let buffer_table = node.get_buffer_table().unwrap();
+                        let buffer_table = node.get_state_table().unwrap();
                         // Check if vnode_count is a placeholder, skip if so as it will be filled later
                         if let Some(vnode_count) = buffer_table.vnode_count_inner().value_opt() {
                             vnode_count

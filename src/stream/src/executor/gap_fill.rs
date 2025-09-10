@@ -40,7 +40,7 @@ struct ExtendedRow {
     row_type: RowType,
 }
 
-pub struct StreamingGapFillExecutor<S: StateStore> {
+pub struct GapFillExecuter<S: StateStore> {
     ctx: ActorContextRef,
     input: Executor,
     schema: Schema,
@@ -55,7 +55,7 @@ pub struct StreamingGapFillExecutor<S: StateStore> {
     row_buffer: Vec<ExtendedRow>,
 }
 
-impl<S: StateStore> StreamingGapFillExecutor<S> {
+impl<S: StateStore> GapFillExecuter<S> {
     /// Compare two ScalarImpl values for ordering (used for time comparison)
     fn compare_scalars(a: &ScalarImpl, b: &ScalarImpl) -> std::cmp::Ordering {
         use risingwave_common::types::ScalarImpl::*;
@@ -287,13 +287,13 @@ impl<S: StateStore> StreamingGapFillExecutor<S> {
     }
 }
 
-impl<S: StateStore> Execute for StreamingGapFillExecutor<S> {
+impl<S: StateStore> Execute for GapFillExecuter<S> {
     fn execute(self: Box<Self>) -> BoxedMessageStream {
         self.execute_inner().boxed()
     }
 }
 
-impl<S: StateStore> StreamingGapFillExecutor<S> {
+impl<S: StateStore> GapFillExecuter<S> {
     #[try_stream(ok = Message, error = StreamExecutorError)]
     async fn execute_inner(self: Box<Self>) {
         let Self {
@@ -311,8 +311,10 @@ impl<S: StateStore> StreamingGapFillExecutor<S> {
         let mut input = input.execute();
 
         let barrier = expect_first_barrier(&mut input).await?;
-        state_table.init_epoch(barrier.epoch).await?;
+        let first_epoch = barrier.epoch;
         yield Message::Barrier(barrier);
+        state_table.init_epoch(first_epoch).await?;
+
 
         // Load data from state table on initialization
         let mut all_rows_from_state: Vec<OwnedRow> = vec![];
@@ -845,7 +847,7 @@ mod tests {
 
         let time_column_index = 0;
 
-        let executor = StreamingGapFillExecutor::new(
+        let executor = GapFillExecuter::new(
             ActorContext::for_test(123),
             source,
             schema.clone(),

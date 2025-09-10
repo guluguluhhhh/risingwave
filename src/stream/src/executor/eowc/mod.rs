@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod gap_fill_eowc;
+mod eowc_gap_fill;
 mod sort;
 mod sort_buffer;
 
-pub use gap_fill_eowc::{FillStrategy, GapFillExecutor, GapFillExecutorArgs};
+pub use eowc_gap_fill::{EowcGapFillExecutor, EowcGapFillExecutorArgs};
 pub use sort::{SortExecutor, SortExecutorArgs};
 pub use sort_buffer::SortBuffer;

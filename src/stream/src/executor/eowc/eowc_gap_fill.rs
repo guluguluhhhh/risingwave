@@ -22,14 +22,14 @@ use tracing::warn;
 use super::sort_buffer::SortBuffer;
 use crate::executor::prelude::*;
 
-pub struct GapFillExecutor<S: StateStore> {
+pub struct EowcGapFillExecutor<S: StateStore> {
     input: Executor,
     inner: ExecutorInner<S>,
 }
 
 use risingwave_common::gap_fill_types::FillStrategy;
 
-pub struct GapFillExecutorArgs<S: StateStore> {
+pub struct EowcGapFillExecutorArgs<S: StateStore> {
     pub actor_ctx: ActorContextRef,
 
     pub input: Executor,
@@ -165,9 +165,7 @@ impl<S: StateStore> ExecutorInner<S> {
         let dummy_row = OwnedRow::new(vec![]);
         let interval_result = gap_interval.eval_row(&dummy_row).await;
         let interval = match interval_result {
-            Ok(Some(ScalarImpl::Interval(interval))) => {
-                interval
-            }
+            Ok(Some(ScalarImpl::Interval(interval))) => interval,
             Ok(val) => {
                 warn!(
                     "Failed to evaluate the interval expression, expected interval, got {:?}. Skipping gap fill.",
@@ -249,14 +247,14 @@ impl<S: StateStore> ExecutorInner<S> {
     }
 }
 
-impl<S: StateStore> Execute for GapFillExecutor<S> {
+impl<S: StateStore> Execute for EowcGapFillExecutor<S> {
     fn execute(self: Box<Self>) -> BoxedMessageStream {
         self.executor_inner().boxed()
     }
 }
 
-impl<S: StateStore> GapFillExecutor<S> {
-    pub fn new(args: GapFillExecutorArgs<S>) -> Self {
+impl<S: StateStore> EowcGapFillExecutor<S> {
+    pub fn new(args: EowcGapFillExecutorArgs<S>) -> Self {
         Self {
             input: args.input,
 
@@ -386,8 +384,8 @@ impl<S: StateStore> GapFillExecutor<S> {
 mod tests {
     use risingwave_common::array::stream_chunk::StreamChunkTestExt;
     use risingwave_common::catalog::{ColumnDesc, ColumnId, Field, TableId};
-    use risingwave_common::types::test_utils::IntervalTestExt;
     use risingwave_common::types::Interval;
+    use risingwave_common::types::test_utils::IntervalTestExt;
     use risingwave_common::util::epoch::test_epoch;
     use risingwave_common::util::sort_util::OrderType;
     use risingwave_expr::expr::LiteralExpression;
@@ -454,7 +452,7 @@ mod tests {
 
         let (tx, source) = MockSource::channel();
         let source = source.into_executor(input_schema, input_pk_indices);
-        let gap_fill_executor = GapFillExecutor::new(GapFillExecutorArgs {
+        let gap_fill_executor = EowcGapFillExecutor::new(EowcGapFillExecutorArgs {
             actor_ctx: ActorContext::for_test(123),
             schema: source.schema().clone(),
             input: source,

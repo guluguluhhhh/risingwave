@@ -40,7 +40,7 @@ struct ExtendedRow {
     row_type: RowType,
 }
 
-pub struct GapFillExecuter<S: StateStore> {
+pub struct GapFillExecutor<S: StateStore> {
     ctx: ActorContextRef,
     input: Executor,
     schema: Schema,
@@ -55,7 +55,7 @@ pub struct GapFillExecuter<S: StateStore> {
     row_buffer: Vec<ExtendedRow>,
 }
 
-impl<S: StateStore> GapFillExecuter<S> {
+impl<S: StateStore> GapFillExecutor<S> {
     /// Compare two ScalarImpl values for ordering (used for time comparison)
     fn compare_scalars(a: &ScalarImpl, b: &ScalarImpl) -> std::cmp::Ordering {
         use risingwave_common::types::ScalarImpl::*;
@@ -287,13 +287,13 @@ impl<S: StateStore> GapFillExecuter<S> {
     }
 }
 
-impl<S: StateStore> Execute for GapFillExecuter<S> {
+impl<S: StateStore> Execute for GapFillExecutor<S> {
     fn execute(self: Box<Self>) -> BoxedMessageStream {
         self.execute_inner().boxed()
     }
 }
 
-impl<S: StateStore> GapFillExecuter<S> {
+impl<S: StateStore> GapFillExecutor<S> {
     #[try_stream(ok = Message, error = StreamExecutorError)]
     async fn execute_inner(self: Box<Self>) {
         let Self {
@@ -847,7 +847,7 @@ mod tests {
 
         let time_column_index = 0;
 
-        let executor = GapFillExecuter::new(
+        let executor = GapFillExecutor::new(
             ActorContext::for_test(123),
             source,
             schema.clone(),

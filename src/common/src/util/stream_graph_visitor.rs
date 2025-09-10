@@ -268,9 +268,13 @@ pub fn visit_stream_node_tables_inner<F>(
                 always!(node.state_table, "StreamCdcScan")
             }
 
+            NodeBody::EowcGapFill(node) => {
+                always!(node.buffer_table, "EowcGapFillBufferTable");
+                always!(node.prev_row_table, "EowcGapFillPrevRowTable");
+            }
+
             NodeBody::GapFill(node) => {
-                always!(node.buffer_table, "GapFillBufferTable");
-                always!(node.prev_row_table, "GapFillPrevRowTable");
+                always!(node.state_table, "GapFillStateTable");
             }
 
             // Note: add internal tables for new nodes here.

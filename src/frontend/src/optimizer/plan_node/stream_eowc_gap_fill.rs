@@ -28,26 +28,25 @@ use crate::optimizer::plan_node::utils::impl_distill_by_unit;
 use crate::optimizer::property::Distribution;
 use crate::stream_fragmenter::BuildFragmentGraphState;
 
-/// `StreamGapFill` implements [`super::Stream`] to represent a gap-filling operation on a time
-/// series in normal streaming mode (without EOWC semantics).
+/// `StreamEowcGapFill` implements [`super::Stream`] to represent a gap-filling operation on a time
+/// series in streaming mode.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct StreamGapFill {
+pub struct StreamEowcGapFill {
     pub base: PlanBase<super::Stream>,
     core: generic::GapFill<PlanRef>,
 }
 
-impl StreamGapFill {
+impl StreamEowcGapFill {
     pub fn new(core: generic::GapFill<PlanRef>) -> Self {
         let input = &core.input;
 
-        // Use singleton distribution for normal streaming GapFill.
-        // Similar to EOWC version, gap filling requires seeing all data
-        // to correctly identify and fill gaps across time series.
+        // Force singleton distribution for GapFill operations.
+        // GapFill requires access to all data across time ranges to correctly identify and fill gaps,
         let base = PlanBase::new_stream_with_core(
             &core,
             Distribution::Single,
             input.append_only(),
-            false, // does NOT provide EOWC semantics
+            true, // provides EOWC semantics
             input.watermark_columns().clone(),
             input.columns_monotonicity().clone(),
         );
@@ -82,7 +81,7 @@ impl StreamGapFill {
         &self.core.fill_strategies
     }
 
-    fn infer_state_table(&self) -> TableCatalog {
+    fn infer_buffer_table(&self) -> TableCatalog {
         let mut tbl_builder = TableCatalogBuilder::default();
 
         let out_schema = self.core.schema();
@@ -90,16 +89,29 @@ impl StreamGapFill {
             tbl_builder.add_column(field);
         }
 
-        // For singleton distribution, use simplified primary key design:
-        // Just use time column as the primary key for ordering
+        // Just use time column as the primary key since SortBuffer requires it for ordering
         let time_col_idx = self.time_col().index();
         tbl_builder.add_order_column(time_col_idx, OrderType::ascending());
 
         tbl_builder.build(vec![], 0)
     }
+
+    fn infer_prev_row_table(&self) -> TableCatalog {
+        let mut tbl_builder = TableCatalogBuilder::default();
+
+        for field in self.core.schema().fields() {
+            tbl_builder.add_column(field);
+        }
+
+        if !self.core.schema().fields().is_empty() {
+            tbl_builder.add_order_column(0, OrderType::ascending());
+        }
+
+        tbl_builder.build(vec![], 0)
+    }
 }
 
-impl PlanTreeNodeUnary for StreamGapFill {
+impl PlanTreeNodeUnary for StreamEowcGapFill {
     fn input(&self) -> PlanRef {
         self.core.input.clone()
     }
@@ -111,10 +123,10 @@ impl PlanTreeNodeUnary for StreamGapFill {
     }
 }
 
-impl_plan_tree_node_for_unary! { StreamGapFill }
-impl_distill_by_unit!(StreamGapFill, core, "StreamGapFill");
+impl_plan_tree_node_for_unary! { StreamEowcGapFill }
+impl_distill_by_unit!(StreamEowcGapFill, core, "StreamEowcGapFill");
 
-impl StreamNode for StreamGapFill {
+impl StreamNode for StreamEowcGapFill {
     fn to_stream_prost_body(&self, state: &mut BuildFragmentGraphState) -> NodeBody {
         use risingwave_pb::stream_plan::*;
 
@@ -128,12 +140,17 @@ impl StreamNode for StreamGapFill {
             })
             .collect();
 
-        let state_table = self
-            .infer_state_table()
+        let buffer_table = self
+            .infer_buffer_table()
             .with_id(state.gen_table_id_wrapped())
             .to_internal_table_prost();
 
-        NodeBody::GapFill(Box::new(GapFillNode {
+        let prev_row_table = self
+            .infer_prev_row_table()
+            .with_id(state.gen_table_id_wrapped())
+            .to_internal_table_prost();
+
+        NodeBody::EowcGapFill(Box::new(EowcGapFillNode {
             time_column_index: self.time_col().index() as u32,
             interval: Some(self.interval().to_expr_proto()),
             fill_columns: self
@@ -142,12 +159,14 @@ impl StreamNode for StreamGapFill {
                 .map(|strategy| strategy.target_col.index() as u32)
                 .collect(),
             fill_strategies,
-            state_table: Some(state_table),
+            buffer_table: Some(buffer_table),
+            prev_row_table: Some(prev_row_table),
         }))
     }
+
 }
 
-impl ExprRewritable for StreamGapFill {
+impl ExprRewritable for StreamEowcGapFill {
     fn has_rewritable_expr(&self) -> bool {
         true
     }
@@ -163,7 +182,7 @@ impl ExprRewritable for StreamGapFill {
     }
 }
 
-impl ExprVisitable for StreamGapFill {
+impl ExprVisitable for StreamEowcGapFill {
     fn visit_exprs(&self, v: &mut dyn ExprVisitor) {
         self.core.visit_exprs(v)
     }

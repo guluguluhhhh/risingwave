@@ -12,25 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use risingwave_common::gap_fill_types::FillStrategy;
 use risingwave_expr::expr::build_from_prost;
-use risingwave_pb::stream_plan::GapFillNode;
+use risingwave_pb::stream_plan::EowcGapFillNode;
 use risingwave_storage::StateStore;
 
 use super::ExecutorBuilder;
 use crate::common::table::state_table::StateTable;
 use crate::error::StreamResult;
-use crate::executor::{Executor, GapFillExecuter};
+use crate::executor::Executor;
+use crate::executor::eowc::{EowcGapFillExecutor, EowcGapFillExecutorArgs};
 use crate::task::ExecutorParams;
 
-pub struct GapFillExecuterBuilder;
+pub struct EowcGapFillExecutorBuilder;
 
-impl ExecutorBuilder for GapFillExecuterBuilder {
-    type Node = GapFillNode;
+impl ExecutorBuilder for EowcGapFillExecutorBuilder {
+    type Node = EowcGapFillNode;
 
     async fn new_boxed_executor(
         params: ExecutorParams,
-        node: &GapFillNode,
+        node: &EowcGapFillNode,
         store: impl StateStore,
     ) -> StreamResult<Executor> {
         let [input]: [_; 1] = params.input.try_into().unwrap();
@@ -61,20 +64,33 @@ impl ExecutorBuilder for GapFillExecuterBuilder {
         let fill_columns_with_strategies: Vec<(usize, FillStrategy)> =
             fill_columns.into_iter().zip(fill_strategies).collect();
 
-        let state_table =
-            StateTable::from_table_catalog(node.get_state_table().as_ref().unwrap(), store, None)
-                .await;
+        let vnodes = params.vnode_bitmap.map(|bitmap| Arc::new(bitmap));
 
-        let exec = GapFillExecuter::new(
-            params.actor_context,
+        let buffer_table = StateTable::from_table_catalog(
+            node.get_buffer_table().as_ref().unwrap(),
+            store.clone(),
+            vnodes.clone(),
+        )
+        .await;
+
+        let prev_row_table = StateTable::from_table_catalog(
+            node.get_prev_row_table().as_ref().unwrap(),
+            store,
+            vnodes,
+        )
+        .await;
+
+        let exec = EowcGapFillExecutor::new(EowcGapFillExecutorArgs {
+            actor_ctx: params.actor_context,
             input,
-            params.info.schema.clone(),
-            1024,
+            schema: params.info.schema.clone(),
+            buffer_table,
+            prev_row_table,
+            chunk_size: 1024, // TODO: make this configurable
             time_column_index,
-            fill_columns_with_strategies,
-            interval_expr,
-            state_table,
-        );
+            fill_columns: fill_columns_with_strategies,
+            gap_interval: interval_expr,
+        });
 
         Ok((params.info, exec).into())
     }

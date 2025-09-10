@@ -125,18 +125,33 @@ impl ToBatch for LogicalGapFill {
 
 impl ToStream for LogicalGapFill {
     fn to_stream(&self, ctx: &mut ToStreamContext) -> Result<PlanRef> {
-        use super::StreamGapFill;
+        use super::{StreamEowcGapFill, StreamGapFill};
         use crate::optimizer::property::RequiredDist;
 
         let stream_input = self.input().to_stream(ctx)?;
 
-        // GapFill always uses singleton distribution for correctness
-        let new_input = RequiredDist::single()
-            .enforce_if_not_satisfies(stream_input, &crate::optimizer::property::Order::any())?;
+        if ctx.emit_on_window_close() {
+            // EOWC GapFill always uses singleton distribution for correctness
+            let new_input = RequiredDist::single().enforce_if_not_satisfies(
+                stream_input,
+                &crate::optimizer::property::Order::any(),
+            )?;
 
-        let mut core = self.core.clone();
-        core.input = new_input;
-        Ok(StreamGapFill::new(core).into())
+            let mut core = self.core.clone();
+            core.input = new_input;
+            Ok(StreamEowcGapFill::new(core).into())
+        } else {
+            // Normal streaming GapFill also requires singleton distribution for correctness
+            // Gap filling needs to see complete time series data to identify and fill gaps properly
+            let new_input = RequiredDist::single().enforce_if_not_satisfies(
+                stream_input,
+                &crate::optimizer::property::Order::any(),
+            )?;
+
+            let mut core = self.core.clone();
+            core.input = new_input;
+            Ok(StreamGapFill::new(core).into())
+        }
     }
 
     fn logical_rewrite_for_stream(

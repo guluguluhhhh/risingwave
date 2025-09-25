@@ -13,14 +13,14 @@
 // limitations under the License.
 
 use risingwave_common::gap_fill_types::FillStrategy;
-use risingwave_expr::expr::build_from_prost;
+use risingwave_expr::expr::build_non_strict_from_prost;
 use risingwave_pb::stream_plan::GapFillNode;
 use risingwave_storage::StateStore;
 
 use super::ExecutorBuilder;
 use crate::common::table::state_table::StateTableBuilder;
 use crate::error::StreamResult;
-use crate::executor::{Executor, GapFillExecutor};
+use crate::executor::{Executor, GapFillExecutor, GapFillExecutorArgs};
 use crate::task::ExecutorParams;
 
 pub struct GapFillExecutorBuilder;
@@ -39,7 +39,8 @@ impl ExecutorBuilder for GapFillExecutorBuilder {
 
         // Parse interval from ExprNode
         let interval_expr_node = node.get_interval()?;
-        let interval_expr = build_from_prost(interval_expr_node)?;
+        let interval_expr =
+            build_non_strict_from_prost(interval_expr_node, params.eval_error_report)?;
 
         let fill_columns: Vec<usize> = node
             .get_fill_columns()
@@ -67,16 +68,16 @@ impl ExecutorBuilder for GapFillExecutorBuilder {
                 .build()
                 .await;
 
-        let exec = GapFillExecutor::new(
-            params.actor_context,
+        let exec = GapFillExecutor::new(GapFillExecutorArgs {
+            ctx: params.actor_context,
             input,
-            params.info.schema.clone(),
-            1024,
+            schema: params.info.schema.clone(),
+            chunk_size: 1024,
             time_column_index,
-            fill_columns_with_strategies,
-            interval_expr,
+            fill_columns: fill_columns_with_strategies,
+            gap_interval: interval_expr,
             state_table,
-        );
+        });
 
         Ok((params.info, exec).into())
     }

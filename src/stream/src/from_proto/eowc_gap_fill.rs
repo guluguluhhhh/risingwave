@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use risingwave_common::gap_fill_types::FillStrategy;
-use risingwave_expr::expr::build_from_prost;
+use risingwave_expr::expr::{NonStrictExpression, build_from_prost};
 use risingwave_pb::stream_plan::EowcGapFillNode;
 use risingwave_storage::StateStore;
 
@@ -43,6 +43,7 @@ impl ExecutorBuilder for EowcGapFillExecutorBuilder {
         // Parse interval from ExprNode
         let interval_expr_node = node.get_interval()?;
         let interval_expr = build_from_prost(interval_expr_node)?;
+        let gap_interval = NonStrictExpression::for_test(interval_expr);
 
         let fill_columns: Vec<usize> = node
             .get_fill_columns()
@@ -90,7 +91,7 @@ impl ExecutorBuilder for EowcGapFillExecutorBuilder {
             chunk_size: 1024, // TODO: make this configurable
             time_column_index,
             fill_columns: fill_columns_with_strategies,
-            gap_interval: interval_expr,
+            gap_interval,
         });
 
         Ok((params.info, exec).into())

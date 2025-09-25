@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use risingwave_common::catalog::Field;
+use risingwave_common::types::DataType;
 use risingwave_common::util::sort_util::OrderType;
 use risingwave_pb::stream_plan::stream_node::NodeBody;
 
@@ -95,6 +97,8 @@ impl StreamGapFill {
         let time_col_idx = self.time_col().index();
         tbl_builder.add_order_column(time_col_idx, OrderType::ascending());
 
+        // Add is_filled flag column for gap fill state tracking
+        tbl_builder.add_column(&Field::with_name(DataType::Boolean, "is_filled"));
         tbl_builder.build(vec![], 0)
     }
 }

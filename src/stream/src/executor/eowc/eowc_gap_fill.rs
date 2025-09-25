@@ -16,7 +16,7 @@ use risingwave_common::array::Op;
 use risingwave_common::row::OwnedRow;
 use risingwave_common::types::{CheckedAdd, Decimal, ToOwnedDatum};
 use risingwave_expr::ExprError;
-use risingwave_expr::expr::Expression;
+use risingwave_expr::expr::NonStrictExpression;
 use tracing::warn;
 
 use super::sort_buffer::SortBuffer;
@@ -40,7 +40,7 @@ pub struct EowcGapFillExecutorArgs<S: StateStore> {
     pub chunk_size: usize,
     pub time_column_index: usize,
     pub fill_columns: Vec<(usize, FillStrategy)>,
-    pub gap_interval: Box<dyn Expression>,
+    pub gap_interval: NonStrictExpression,
 }
 
 struct ExecutorInner<S: StateStore> {
@@ -52,7 +52,7 @@ struct ExecutorInner<S: StateStore> {
     chunk_size: usize,
     time_column_index: usize,
     fill_columns: Vec<(usize, FillStrategy)>,
-    gap_interval: Box<dyn Expression>,
+    gap_interval: NonStrictExpression,
 }
 
 struct ExecutionVars<S: StateStore> {
@@ -99,7 +99,7 @@ impl<S: StateStore> ExecutorInner<S> {
                 (ScalarImpl::Float32(v1), &ScalarImpl::Float32(v2)) => *v1 += v2,
                 (ScalarImpl::Float64(v1), &ScalarImpl::Float64(v2)) => *v1 += v2,
                 (ScalarImpl::Decimal(v1), &ScalarImpl::Decimal(v2)) => *v1 = *v1 + v2,
-                _ => return,
+                _ => (),
             }
         };
     }
@@ -109,7 +109,7 @@ impl<S: StateStore> ExecutorInner<S> {
         curr_row: &OwnedRow,
         time_column_index: usize,
         fill_columns: &[(usize, FillStrategy)],
-        gap_interval: &dyn Expression,
+        gap_interval: &NonStrictExpression,
     ) -> Result<Vec<OwnedRow>, ExprError> {
         let mut filled_rows = Vec::new();
         let (Some(prev_time_scalar), Some(curr_time_scalar)) = (
@@ -163,18 +163,15 @@ impl<S: StateStore> ExecutorInner<S> {
         }
 
         let dummy_row = OwnedRow::new(vec![]);
-        let interval_result = gap_interval.eval_row(&dummy_row).await;
+        let interval_result = gap_interval.eval_row_infallible(&dummy_row).await;
         let interval = match interval_result {
-            Ok(Some(ScalarImpl::Interval(interval))) => interval,
-            Ok(val) => {
+            Some(ScalarImpl::Interval(interval)) => interval,
+            val => {
                 warn!(
                     "Failed to evaluate the interval expression, expected interval, got {:?}. Skipping gap fill.",
                     val
                 );
                 return Ok(filled_rows);
-            }
-            Err(e) => {
-                return Err(e);
             }
         };
 
@@ -223,7 +220,7 @@ impl<S: StateStore> ExecutorInner<S> {
                 }
             };
         }
-        for (col_idx, strategy) in fill_columns.iter() {
+        for (col_idx, strategy) in fill_columns {
             if matches!(strategy, FillStrategy::Interpolate) {
                 let steps = data.len();
                 let step = Self::calculate_step(
@@ -304,23 +301,19 @@ impl<S: StateStore> EowcGapFillExecutor<S> {
                     let mut chunk_builder =
                         StreamChunkBuilder::new(this.chunk_size, this.schema.data_types());
 
-                    let mut all_rows = Vec::new();
                     #[for_await]
                     for row in vars
                         .buffer
                         .consume(watermark.val.clone(), &mut this.buffer_table)
                     {
-                        all_rows.push(row?);
-                    }
-
-                    for current_row in all_rows {
+                        let current_row = row?;
                         if let Some(p_row) = &staging_prev_row {
                             let filled_rows = ExecutorInner::<S>::generate_filled_rows(
                                 p_row,
                                 &current_row,
                                 this.time_column_index,
                                 &this.fill_columns,
-                                &*this.gap_interval,
+                                &this.gap_interval,
                             )
                             .await?;
                             for filled_row in filled_rows {
@@ -369,10 +362,9 @@ impl<S: StateStore> EowcGapFillExecutor<S> {
 
                     if let Some((_, cache_may_stale)) =
                         post_commit.post_yield_barrier(update_vnode_bitmap).await?
+                        && cache_may_stale
                     {
-                        if cache_may_stale {
-                            vars.buffer.refill_cache(None, &this.buffer_table).await?;
-                        }
+                        vars.buffer.refill_cache(None, &this.buffer_table).await?;
                     }
                 }
             }
@@ -398,7 +390,7 @@ mod tests {
     async fn create_executor<S: StateStore>(
         time_column_index: usize,
         fill_columns: Vec<(usize, FillStrategy)>,
-        gap_interval: Box<dyn Expression>,
+        gap_interval: NonStrictExpression,
         store: S,
     ) -> (MessageSender, BoxedMessageStream) {
         let input_schema = Schema::new(vec![
@@ -481,7 +473,7 @@ mod tests {
         let (mut tx, mut gap_fill_executor) = create_executor(
             time_column_index,
             fill_columns,
-            Box::new(LiteralExpression::new(
+            NonStrictExpression::for_test(LiteralExpression::new(
                 DataType::Interval,
                 Some(gap_interval.into()),
             )),
@@ -548,7 +540,7 @@ mod tests {
         let (mut tx, mut gap_fill_executor) = create_executor(
             time_column_index,
             fill_columns,
-            Box::new(LiteralExpression::new(
+            NonStrictExpression::for_test(LiteralExpression::new(
                 DataType::Interval,
                 Some(gap_interval.into()),
             )),
@@ -615,7 +607,7 @@ mod tests {
         let (mut tx, mut gap_fill_executor) = create_executor(
             time_column_index,
             fill_columns,
-            Box::new(LiteralExpression::new(
+            NonStrictExpression::for_test(LiteralExpression::new(
                 DataType::Interval,
                 Some(gap_interval.into()),
             )),
@@ -682,7 +674,7 @@ mod tests {
         let (mut tx, mut gap_fill_executor) = create_executor(
             time_column_index,
             fill_columns,
-            Box::new(LiteralExpression::new(
+            NonStrictExpression::for_test(LiteralExpression::new(
                 DataType::Interval,
                 Some(gap_interval.into()),
             )),
@@ -749,7 +741,7 @@ mod tests {
         let (mut tx, mut gap_fill_executor) = create_executor(
             time_column_index,
             fill_columns.clone(),
-            Box::new(LiteralExpression::new(
+            NonStrictExpression::for_test(LiteralExpression::new(
                 DataType::Interval,
                 Some(gap_interval.into()),
             )),
@@ -772,7 +764,7 @@ mod tests {
         let (mut recovered_tx, mut recovered_gap_fill_executor) = create_executor(
             time_column_index,
             fill_columns.clone(),
-            Box::new(LiteralExpression::new(
+            NonStrictExpression::for_test(LiteralExpression::new(
                 DataType::Interval,
                 Some(gap_interval.into()),
             )),
@@ -818,7 +810,7 @@ mod tests {
         let (mut final_recovered_tx, mut final_recovered_gap_fill_executor) = create_executor(
             time_column_index,
             fill_columns,
-            Box::new(LiteralExpression::new(
+            NonStrictExpression::for_test(LiteralExpression::new(
                 DataType::Interval,
                 Some(gap_interval.into()),
             )),

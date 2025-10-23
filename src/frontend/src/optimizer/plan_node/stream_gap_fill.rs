@@ -42,6 +42,17 @@ impl StreamGapFill {
     pub fn new(core: generic::GapFill<PlanRef<Stream>>) -> Self {
         let input = &core.input;
 
+        // Verify that time_col is part of the upstream stream key to ensure
+        // that there are no duplicate rows for the same time point.
+        let time_col_idx = core.time_col.index();
+        let input_stream_key = input.expect_stream_key();
+        assert!(
+            input_stream_key.contains(&time_col_idx),
+            "GapFill time column (index {}) must be part of the upstream stream key {:?} to avoid logic errors with duplicate rows",
+            time_col_idx,
+            input_stream_key
+        );
+
         // Use singleton distribution for normal streaming GapFill.
         // Similar to EOWC version, gap filling requires seeing all data
         // to correctly identify and fill gaps across time series.

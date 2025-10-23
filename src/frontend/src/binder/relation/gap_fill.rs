@@ -118,6 +118,17 @@ impl Binder {
                     })?;
 
                     if let ExprImpl::InputRef(input_ref) = arg_expr {
+                        // Check datatype for interpolate
+                        if matches!(strategy, FillStrategy::Interpolate) {
+                            let data_type = &input_ref.data_type;
+                            if !data_type.is_numeric() || matches!(data_type, DataType::Serial) {
+                                return Err(ErrorCode::BindError(format!(
+                                    "INTERPOLATE only supports numeric types, got {}",
+                                    data_type
+                                ))
+                                .into());
+                            }
+                        }
                         (strategy, *input_ref)
                     } else {
                         return Err(ErrorCode::BindError(

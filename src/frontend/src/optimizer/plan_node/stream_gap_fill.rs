@@ -42,13 +42,13 @@ impl StreamGapFill {
     pub fn new(core: generic::GapFill<PlanRef<Stream>>) -> Self {
         let input = &core.input;
 
-        // Verify that time_col is part of the upstream stream key to ensure
-        // that there are no duplicate rows for the same time point.
+        // Verify that time_col is the ONLY stream key to ensure correctness.
+        // GAP_FILL requires the time column to uniquely identify rows.
         let time_col_idx = core.time_col.index();
         let input_stream_key = input.expect_stream_key();
         assert!(
-            input_stream_key.contains(&time_col_idx),
-            "GapFill time column (index {}) must be part of the upstream stream key {:?} to avoid logic errors with duplicate rows",
+            input_stream_key.len() == 1 && input_stream_key[0] == time_col_idx,
+            "GapFill requires the time column (index {}) to be the sole primary key. Found stream key: {:?}",
             time_col_idx,
             input_stream_key
         );

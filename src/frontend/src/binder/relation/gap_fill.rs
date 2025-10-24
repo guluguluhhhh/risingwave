@@ -92,7 +92,7 @@ impl Binder {
                     let strategy = match name.as_str() {
                         "interpolate" => FillStrategy::Interpolate,
                         "locf" => FillStrategy::Locf,
-                        "null" => FillStrategy::Null,
+                        "keepnull" => FillStrategy::Null,
                         _ => {
                             return Err(ErrorCode::BindError(format!(
                                 "Unsupported fill strategy: {}",

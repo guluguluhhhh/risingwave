@@ -83,6 +83,23 @@ impl Binder {
             .into());
         }
 
+        // Validate that the interval is not zero (only works for constant intervals)
+        if let ExprImpl::Literal(literal) = &interval {
+            if let Some(value) = literal.get_data() {
+                if let risingwave_common::types::ScalarImpl::Interval(interval_value) = value {
+                    if interval_value.months() == 0
+                        && interval_value.days() == 0
+                        && interval_value.usecs() == 0
+                    {
+                        return Err(ErrorCode::BindError(
+                            "The gap fill interval cannot be zero".to_string(),
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+
         let mut fill_strategies = vec![];
         for arg in args_iter {
             let (strategy, target_col) =

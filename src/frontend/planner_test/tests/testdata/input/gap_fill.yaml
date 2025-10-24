@@ -117,3 +117,10 @@
   expected_outputs:
     - binder_error
 
+- name: zero interval
+  sql: |
+    CREATE TABLE t (ts TIMESTAMP, val DOUBLE, PRIMARY KEY(ts));
+    SELECT * FROM GAP_FILL(t, ts, INTERVAL '0' SECOND, LOCF(val));
+  expected_outputs:
+    - binder_error
+

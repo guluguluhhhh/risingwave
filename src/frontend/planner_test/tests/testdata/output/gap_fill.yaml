@@ -115,3 +115,8 @@
     CREATE TABLE t (ts TIMESTAMP, val DOUBLE);
     SELECT * FROM GAP_FILL(t, ts, INTERVAL '1' MINUTE, LOCF(val + 1));
   binder_error: 'Bind error: Fill strategy argument must be a column reference'
+- name: zero interval
+  sql: |
+    CREATE TABLE t (ts TIMESTAMP, val DOUBLE, PRIMARY KEY(ts));
+    SELECT * FROM GAP_FILL(t, ts, INTERVAL '0' SECOND, LOCF(val));
+  binder_error: 'Bind error: The gap fill interval cannot be zero'

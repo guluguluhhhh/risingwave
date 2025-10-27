@@ -18,6 +18,7 @@ use std::ops::Bound;
 use futures::{StreamExt, pin_mut};
 use risingwave_common::array::Op;
 use risingwave_common::gap_fill_types::FillStrategy;
+use risingwave_common::metrics::LabelGuardedIntCounter;
 use risingwave_common::row::{self, CompactedRow, OwnedRow, Row};
 use risingwave_common::types::{
     CheckedAdd, Datum, Decimal, ScalarImpl, ScalarRefImpl, ToOwnedDatum,
@@ -181,7 +182,7 @@ impl<S: StateStore> ManagedGapFillState<S> {
 
         let state_table_iter = self
             .state_table
-            .iter_with_prefix(
+            .rev_iter_with_prefix(
                 &None::<row::Empty>,
                 sub_range,
                 PrefetchOptions::prefetch_for_large_range_scan(),
@@ -191,24 +192,21 @@ impl<S: StateStore> ManagedGapFillState<S> {
 
         let mut results = Vec::new();
 
-        // Collect all data and then take the last `limit` rows.
-        let mut temp_results = Vec::new();
+        // Collect at most `limit` rows in reverse order.
         while let Some(item) = state_table_iter.next().await {
             let state_row = item?.into_owned_row();
             let gapfill_row = self.get_gapfill_row(state_row);
-            temp_results.push((
+            results.push((
                 gapfill_row.cache_key,
                 (&gapfill_row.row).into(),
                 gapfill_row.row_type,
             ));
+            if results.len() >= limit {
+                break;
+            }
         }
 
-        let start_idx = if temp_results.len() > limit {
-            temp_results.len() - limit
-        } else {
-            0
-        };
-        results.extend_from_slice(&temp_results[start_idx..]);
+        results.reverse();
 
         Ok(results)
     }
@@ -270,59 +268,6 @@ impl<S: StateStore> ManagedGapFillState<S> {
         )
     }
 
-    /// Fill cache with data from state table within time range.
-    pub async fn fill_cache_range(
-        &self,
-        cache: &mut GapFillCache,
-        start_time_key: Option<GapFillCacheKey>,
-        end_time_key: Option<GapFillCacheKey>,
-        cache_size_limit: usize,
-    ) -> StreamExecutorResult<()> {
-        let sub_range: &(Bound<OwnedRow>, Bound<OwnedRow>) = &(Bound::Unbounded, Bound::Unbounded);
-        let state_table_iter = self
-            .state_table
-            .iter_with_prefix(
-                &None::<row::Empty>,
-                sub_range,
-                PrefetchOptions {
-                    prefetch: cache_size_limit == usize::MAX,
-                    for_large_query: false,
-                },
-            )
-            .await?;
-        pin_mut!(state_table_iter);
-
-        let mut loaded_count = 0;
-        while let Some(item) = state_table_iter.next().await {
-            if loaded_count >= cache_size_limit {
-                break;
-            }
-
-            let state_row = item?.into_owned_row();
-            let gapfill_row = self.get_gapfill_row(state_row);
-
-            // Check if within time range.
-            if let Some(start_key) = &start_time_key
-                && &gapfill_row.cache_key < start_key
-            {
-                continue;
-            }
-            if let Some(end_key) = &end_time_key
-                && &gapfill_row.cache_key > end_key
-            {
-                break;
-            }
-
-            cache.insert(
-                gapfill_row.cache_key,
-                ((&gapfill_row.row).into(), gapfill_row.row_type),
-            );
-            loaded_count += 1;
-        }
-
-        Ok(())
-    }
-
     pub async fn flush(
         &mut self,
         epoch: EpochPair,
@@ -369,8 +314,15 @@ pub struct GapFillCacheManager {
 
 impl EstimateSize for GapFillCacheManager {
     fn estimated_heap_size(&self) -> usize {
-        // Approximate size estimation for BTreeMap.
-        self.cache.len() * std::mem::size_of::<(GapFillCacheKey, (CompactedRow, RowType))>()
+        // Sum the estimated heap size of all entries in the cache.
+        self.cache
+            .iter()
+            .map(|(key, (row, _row_type))| {
+                key.estimated_heap_size()
+                    + row.estimated_heap_size()
+                    + std::mem::size_of::<RowType>()
+            })
+            .sum()
     }
 }
 
@@ -421,7 +373,7 @@ impl GapFillCacheManager {
     }
 
     /// Finds the closest previous original row, scanning through the `StateStore` if not in cache.
-    pub async fn find_robust_prev_original<S: StateStore>(
+    pub async fn find_prev_original<S: StateStore>(
         &mut self,
         target_time: &GapFillCacheKey,
         managed_state: &ManagedGapFillState<S>,
@@ -442,30 +394,20 @@ impl GapFillCacheManager {
                 .scan_range_before(&current_search_end_time, self.capacity)
                 .await?;
 
-            if window_rows.is_empty() {
-                return Ok(None);
-            }
-
-            self.load_window(window_rows.clone());
-
-            // Search for previous original row in this new continuous window.
+            let earliest_key = match window_rows.first() {
+                None => return Ok(None),
+                Some((key, _, _)) => key.clone(),
+            };
+            self.load_window(window_rows);
             if let Some(result) = self.find_prev_original_in_cache(target_time) {
-                // Found, and since we're scanning backwards, this is guaranteed to be the closest.
                 return Ok(Some(result));
-            } else {
-                // No original row found in this window, continue searching backwards.
-                if let Some(earliest_key) = window_rows.first().map(|(key, _, _)| key) {
-                    current_search_end_time = earliest_key.clone();
-                } else {
-                    // This shouldn't happen since we checked `window_rows` is not empty.
-                    return Ok(None);
-                }
             }
+            current_search_end_time = earliest_key;
         }
     }
 
     /// Finds the closest next original row, scanning through the `StateStore` if not in cache.
-    pub async fn find_robust_next_original<S: StateStore>(
+    pub async fn find_next_original<S: StateStore>(
         &mut self,
         target_time: &GapFillCacheKey,
         managed_state: &ManagedGapFillState<S>,
@@ -486,25 +428,15 @@ impl GapFillCacheManager {
                 .scan_range_after(&current_search_start_time, self.capacity)
                 .await?;
 
-            if window_rows.is_empty() {
-                return Ok(None);
-            }
-
-            self.load_window(window_rows.clone());
-
-            // Search for next original row in this new continuous window.
+            let latest_key = match window_rows.last() {
+                None => return Ok(None),
+                Some((key, _, _)) => key.clone(),
+            };
+            self.load_window(window_rows);
             if let Some(result) = self.find_next_original_in_cache(target_time) {
-                // Found, and since we're scanning forwards, this is guaranteed to be the closest.
                 return Ok(Some(result));
-            } else {
-                // No original row found in this window, continue searching forwards.
-                if let Some(latest_key) = window_rows.last().map(|(key, _, _)| key) {
-                    current_search_start_time = latest_key.clone();
-                } else {
-                    // This shouldn't happen since we checked `window_rows` is not empty.
-                    return Ok(None);
-                }
             }
+            current_search_start_time = latest_key;
         }
     }
 
@@ -516,15 +448,11 @@ impl GapFillCacheManager {
         self.update_window_bounds_for_insert(&cache_key);
 
         while self.cache.len() > self.capacity {
-            if let Some((key, _)) = self.cache.iter().next() {
-                let key = key.clone();
-                self.cache.remove(&key);
-                // Update bounds after eviction
-                self.update_window_bounds_after_removal();
-            } else {
+            if self.cache.pop_first().is_none() {
                 break;
             }
         }
+        self.update_window_bounds_after_removal();
     }
 
     pub fn remove(&mut self, cache_key: &GapFillCacheKey) -> Option<(CompactedRow, RowType)> {
@@ -624,6 +552,64 @@ impl GapFillCacheManager {
             }
         }
     }
+
+    /// Scans cache for filled rows between two time points (exclusive).
+    pub fn scan_filled_rows_between_in_cache<S: StateStore>(
+        &self,
+        start_time: &GapFillCacheKey,
+        end_time: &GapFillCacheKey,
+        managed_state: &ManagedGapFillState<S>,
+    ) -> StreamExecutorResult<(Vec<(OwnedRow, OwnedRow)>, bool)> {
+        let mut filled_rows_in_cache = Vec::new();
+
+        // Check if both start_time and end_time are within cache bounds
+        let range_fully_in_cache = self.contains_time(start_time) && self.contains_time(end_time);
+
+        if range_fully_in_cache {
+            for (_cache_key, (compacted_row, row_type)) in self.cache.range::<GapFillCacheKey, _>((
+                std::ops::Bound::Excluded(start_time),
+                std::ops::Bound::Excluded(end_time),
+            )) {
+                if *row_type == RowType::Filled {
+                    // Convert compacted row back to owned row
+                    let data_types = managed_state.state_table.get_data_types();
+                    let mut row_data_types = data_types.to_vec();
+                    // Remove the is_filled column type since cache stores original schema
+                    row_data_types.pop();
+
+                    let row = compacted_row.deserialize(&row_data_types)?;
+                    let time_datum = row.datum_at(managed_state.time_column_index);
+                    let state_key = OwnedRow::new(vec![time_datum.to_owned_datum()]);
+                    // Convert to state row format (with is_filled flag)
+                    let state_row = ManagedGapFillState::<S>::row_to_state_row(&row, true);
+                    filled_rows_in_cache.push((state_key, state_row));
+                }
+            }
+        }
+
+        Ok((filled_rows_in_cache, range_fully_in_cache))
+    }
+
+    pub async fn scan_filled_rows_between<S: StateStore>(
+        &self,
+        start_time: &GapFillCacheKey,
+        end_time: &GapFillCacheKey,
+        managed_state: &ManagedGapFillState<S>,
+    ) -> StreamExecutorResult<Vec<(OwnedRow, OwnedRow)>> {
+        // Try to scan filled rows from cache first
+        let (filled_rows_cache, range_fully_in_cache) =
+            self.scan_filled_rows_between_in_cache(start_time, end_time, managed_state)?;
+
+        if range_fully_in_cache {
+            // Cache covers the entire range, use cache results
+            Ok(filled_rows_cache)
+        } else {
+            // Cache doesn't cover the range, fall back to state table scan
+            managed_state
+                .scan_filled_rows_between(start_time, end_time)
+                .await
+        }
+    }
 }
 
 pub struct GapFillExecutor<S: StateStore> {
@@ -638,6 +624,13 @@ pub struct GapFillExecutor<S: StateStore> {
     // State management
     managed_state: ManagedGapFillState<S>,
     cache_manager: GapFillCacheManager,
+
+    // Metrics
+    metrics: GapFillMetrics,
+}
+
+pub struct GapFillMetrics {
+    pub gap_fill_generated_rows_count: LabelGuardedIntCounter,
 }
 
 impl<S: StateStore> GapFillExecutor<S> {
@@ -645,6 +638,15 @@ impl<S: StateStore> GapFillExecutor<S> {
         let managed_state =
             ManagedGapFillState::new(args.state_table, args.time_column_index, &args.schema);
         let cache_manager = GapFillCacheManager::new(GAPFILL_CACHE_DEFAULT_CAPACITY);
+
+        let metrics = args.ctx.streaming_metrics.clone();
+        let actor_id = args.ctx.id.to_string();
+        let fragment_id = args.ctx.fragment_id.to_string();
+        let gap_fill_metrics = GapFillMetrics {
+            gap_fill_generated_rows_count: metrics
+                .gap_fill_generated_rows_count
+                .with_guarded_label_values(&[&actor_id, &fragment_id]),
+        };
 
         Self {
             ctx: args.ctx,
@@ -656,14 +658,32 @@ impl<S: StateStore> GapFillExecutor<S> {
             gap_interval: args.gap_interval,
             managed_state,
             cache_manager,
+            metrics: gap_fill_metrics,
         }
     }
 
+    /// Calculates the step size for interpolation between two values.
+    ///
+    /// # Parameters
+    /// - `d1`: The starting value as a `Datum`.
+    /// - `d2`: The ending value as a `Datum`.
+    /// - `steps`: The number of steps to interpolate between `d1` and `d2`.
+    ///
+    /// # Returns
+    /// Returns a `Datum` representing the step size for each interpolation step,
+    /// or `None` if the input values are not compatible or `steps` is zero.
+    ///
+    /// # Calculation
+    /// For supported types, computes `(d2 - d1) / steps` and returns the result as a `Datum`.
     fn calculate_step(d1: Datum, d2: Datum, steps: usize) -> Datum {
         let (Some(s1), Some(s2)) = (d1, d2) else {
             return None;
         };
         if steps == 0 {
+            debug_assert!(
+                steps != 0,
+                "GapFillExecutor::calculate_step called with steps == 0, which may indicate a logic error."
+            );
             return None;
         }
         match (ScalarRefImpl::from(&s1), ScalarRefImpl::from(&s2)) {
@@ -689,6 +709,10 @@ impl<S: StateStore> GapFillExecutor<S> {
         }
     }
 
+    /// Mutates the `current` datum by adding the value of `step` to it.
+    /// This function is used during the interpolation process in gap filling,
+    /// where it incrementally updates the datum to generate intermediate values
+    /// between known data points.
     fn apply_step(current: &mut Datum, step: &ScalarImpl) {
         if let Some(curr) = current.as_mut() {
             match (curr, step) {
@@ -703,12 +727,30 @@ impl<S: StateStore> GapFillExecutor<S> {
         }
     }
 
+    /// Generates interpolated rows between two time points (`prev_row` and `curr_row`) using a static interval.
+    ///
+    /// # Parameters
+    /// - `prev_row`: Reference to the previous row (start of the gap).
+    /// - `curr_row`: Reference to the current row (end of the gap).
+    /// - `interval`: The interval to use for generating each filled row (typically a time interval).
+    /// - `time_column_index`: The index of the time column in the row, used to increment time values.
+    /// - `fill_columns`: A slice of tuples, each containing a column index and a `FillStrategy` specifying how to fill missing values in that column.
+    /// - `metrics`: Metrics for tracking the number of generated rows.
+    ///
+    /// # Fill Strategy Application
+    /// For each filled row, the function applies the specified `FillStrategy` for each column:
+    /// - `FillStrategy::Previous`: Uses the value from the previous row.
+    /// - `FillStrategy::Linear`: Interpolates linearly between the previous and current row values.
+    /// - Other strategies may be supported as defined in `FillStrategy`.
+    ///
+    /// Returns a vector of `OwnedRow` representing the filled rows between `prev_row` and `curr_row`.
     fn generate_filled_rows_between_static(
         prev_row: &OwnedRow,
         curr_row: &OwnedRow,
         interval: &risingwave_common::types::Interval,
         time_column_index: usize,
         fill_columns: &[(usize, FillStrategy)],
+        metrics: &GapFillMetrics,
     ) -> StreamExecutorResult<Vec<OwnedRow>> {
         let mut filled_rows = Vec::new();
 
@@ -757,75 +799,122 @@ impl<S: StateStore> GapFillExecutor<S> {
             return Ok(filled_rows);
         }
 
-        // Generate template row with fill strategies
-        let mut fill_values: Vec<Datum> = Vec::with_capacity(prev_row.len());
-        for i in 0..prev_row.len() {
-            if i == time_column_index {
-                fill_values.push(None); // Will be set later
-            } else if let Some((_, strategy)) = fill_columns.iter().find(|(col, _)| *col == i) {
-                match strategy {
-                    FillStrategy::Locf | FillStrategy::Interpolate => {
-                        fill_values.push(prev_row.datum_at(i).to_owned_datum())
-                    }
-                    FillStrategy::Null => fill_values.push(None),
-                }
-            } else {
-                fill_values.push(prev_row.datum_at(i).to_owned_datum());
-            }
-        }
-
-        // Generate filled timestamps
+        // Calculate the number of rows to be generated and validate
         let mut fill_time = match prev_time.checked_add(*interval) {
             Some(t) => t,
-            None => return Ok(filled_rows),
+            None => {
+                // If the interval is so large that adding it to prev_time causes overflow,
+                // it means we shouldn't do gap fill at all.
+                warn!(
+                    "Gap fill interval is too large, causing timestamp overflow. \
+                     No gap filling will be performed between {:?} and {:?}.",
+                    prev_time, curr_time
+                );
+                return Ok(filled_rows);
+            }
         };
 
-        let mut data = Vec::new();
-        while fill_time < curr_time {
-            let mut new_row_data = fill_values.clone();
-            let fill_time_scalar = match prev_time_scalar {
-                ScalarRefImpl::Timestamp(_) => ScalarImpl::Timestamp(fill_time),
-                ScalarRefImpl::Timestamptz(_) => {
-                    let micros = fill_time.0.and_utc().timestamp_micros();
-                    ScalarImpl::Timestamptz(risingwave_common::types::Timestamptz::from_micros(
-                        micros,
-                    ))
-                }
-                _ => unreachable!("Time column should be Timestamp or Timestamptz"),
-            };
-            new_row_data[time_column_index] = Some(fill_time_scalar);
-            data.push(new_row_data);
+        // Check if fill_time is already >= curr_time, which means no gap to fill
+        if fill_time >= curr_time {
+            return Ok(filled_rows);
+        }
 
-            fill_time = match fill_time.checked_add(*interval) {
+        // Count the number of rows to generate
+        let mut row_count = 0;
+        let mut temp_time = fill_time;
+        while temp_time < curr_time {
+            row_count += 1;
+            temp_time = match temp_time.checked_add(*interval) {
                 Some(t) => t,
                 None => break,
             };
         }
 
-        // --- NEW LOGIC FOR INTERPOLATION ---
-        for (col_idx, strategy) in fill_columns {
-            if matches!(strategy, FillStrategy::Interpolate) {
-                let steps = data.len();
-                let step = Self::calculate_step(
-                    prev_row.datum_at(*col_idx).to_owned_datum(),
-                    curr_row.datum_at(*col_idx).to_owned_datum(),
-                    steps + 1,
-                );
-                if let Some(step) = step {
-                    for (i, row) in data.iter_mut().enumerate() {
-                        // The value in `row` is a copy of `prev_row`.
-                        // So we need to apply step `i+1` times.
-                        for _ in 0..=i {
-                            Self::apply_step(&mut row[*col_idx], &step);
-                        }
-                    }
+        // Pre-compute interpolation steps for each column that requires interpolation
+        let mut interpolation_steps: Vec<Option<ScalarImpl>> = Vec::new();
+        let mut interpolation_states: Vec<Datum> = Vec::new();
+
+        for i in 0..prev_row.len() {
+            if let Some((_, strategy)) = fill_columns.iter().find(|(col, _)| *col == i) {
+                if matches!(strategy, FillStrategy::Interpolate) {
+                    let step = Self::calculate_step(
+                        prev_row.datum_at(i).to_owned_datum(),
+                        curr_row.datum_at(i).to_owned_datum(),
+                        row_count + 1,
+                    );
+                    interpolation_steps.push(step.clone());
+                    interpolation_states.push(prev_row.datum_at(i).to_owned_datum());
+                } else {
+                    interpolation_steps.push(None);
+                    interpolation_states.push(None);
                 }
+            } else {
+                interpolation_steps.push(None);
+                interpolation_states.push(None);
             }
         }
 
-        for row_data in data {
-            filled_rows.push(OwnedRow::new(row_data));
+        // Generate filled rows, applying the appropriate strategy for each column
+        while fill_time < curr_time {
+            let mut new_row_data = Vec::with_capacity(prev_row.len());
+
+            for col_idx in 0..prev_row.len() {
+                let datum = if col_idx == time_column_index {
+                    // Time column: use the incremented timestamp
+                    let fill_time_scalar = match prev_time_scalar {
+                        ScalarRefImpl::Timestamp(_) => ScalarImpl::Timestamp(fill_time),
+                        ScalarRefImpl::Timestamptz(_) => {
+                            let micros = fill_time.0.and_utc().timestamp_micros();
+                            ScalarImpl::Timestamptz(
+                                risingwave_common::types::Timestamptz::from_micros(micros),
+                            )
+                        }
+                        _ => unreachable!("Time column should be Timestamp or Timestamptz"),
+                    };
+                    Some(fill_time_scalar)
+                } else if let Some((_, strategy)) =
+                    fill_columns.iter().find(|(col, _)| *col == col_idx)
+                {
+                    // Apply the fill strategy for this column
+                    match strategy {
+                        FillStrategy::Locf => prev_row.datum_at(col_idx).to_owned_datum(),
+                        FillStrategy::Null => None,
+                        FillStrategy::Interpolate => {
+                            // Apply interpolation step and update cumulative value
+                            if let Some(step) = &interpolation_steps[col_idx] {
+                                Self::apply_step(&mut interpolation_states[col_idx], step);
+                                interpolation_states[col_idx].clone()
+                            } else {
+                                prev_row.datum_at(col_idx).to_owned_datum()
+                            }
+                        }
+                    }
+                } else {
+                    // No strategy specified, use the value from previous row
+                    prev_row.datum_at(col_idx).to_owned_datum()
+                };
+                new_row_data.push(datum);
+            }
+
+            filled_rows.push(OwnedRow::new(new_row_data));
+
+            fill_time = match fill_time.checked_add(*interval) {
+                Some(t) => t,
+                None => {
+                    // Time overflow during iteration, stop filling
+                    warn!(
+                        "Gap fill stopped due to timestamp overflow after generating {} rows.",
+                        filled_rows.len()
+                    );
+                    break;
+                }
+            };
         }
+
+        // Update metrics with the number of generated rows
+        metrics
+            .gap_fill_generated_rows_count
+            .inc_by(filled_rows.len() as u64);
 
         Ok(filled_rows)
     }
@@ -850,6 +939,7 @@ impl<S: StateStore> GapFillExecutor<S> {
             gap_interval,
             ctx,
             input,
+            metrics,
         } = *self;
 
         let mut input = input.execute();
@@ -859,14 +949,19 @@ impl<S: StateStore> GapFillExecutor<S> {
         yield Message::Barrier(barrier);
         managed_state.init_epoch(first_epoch).await?;
 
-        // Initialize the cache with initial data from the state table.
-        let mut temp_cache = GapFillCache::new();
-        managed_state
-            .fill_cache_range(&mut temp_cache, None, None, cache_manager.capacity)
-            .await?;
+        // Start with an empty cache - use lazy loading strategy.
+        // Data will be loaded on-demand when gap filling operations require it.
 
-        for (key, (row, row_type)) in temp_cache {
-            cache_manager.insert(key, row, row_type);
+        // Calculate and validate gap interval once at initialization
+        let dummy_row = OwnedRow::new(vec![]);
+        let interval_datum = gap_interval.eval_row_infallible(&dummy_row).await;
+        let interval = interval_datum
+            .ok_or_else(|| anyhow::anyhow!("Gap interval expression returned null"))?
+            .into_interval();
+
+        // Validate that gap interval is not zero
+        if interval.months() == 0 && interval.days() == 0 && interval.usecs() == 0 {
+            Err(anyhow::anyhow!("Gap interval cannot be zero"))?;
         }
 
         #[for_await]
@@ -875,16 +970,6 @@ impl<S: StateStore> GapFillExecutor<S> {
                 Message::Chunk(chunk) => {
                     let chunk = chunk.compact();
                     let mut output_rows = Vec::new();
-
-                    // Get interval for gap filling.
-                    let dummy_row = OwnedRow::new(vec![]);
-                    let interval = if let Some(ScalarImpl::Interval(interval)) =
-                        gap_interval.eval_row_infallible(&dummy_row).await
-                    {
-                        interval
-                    } else {
-                        continue;
-                    };
 
                     for (op, row_ref) in chunk.rows() {
                         let row = row_ref.into_owned_row();
@@ -895,18 +980,22 @@ impl<S: StateStore> GapFillExecutor<S> {
 
                                 // Find previous and next original row neighbors.
                                 let prev_original = cache_manager
-                                    .find_robust_prev_original(&cache_key, &managed_state)
+                                    .find_prev_original(&cache_key, &managed_state)
                                     .await?;
                                 let next_original = cache_manager
-                                    .find_robust_next_original(&cache_key, &managed_state)
+                                    .find_next_original(&cache_key, &managed_state)
                                     .await?;
 
-                                // If both neighbors exist, delete fill rows between them.
+                                // If both neighbors exist, delete previously fill rows between them.
                                 if let (Some((prev_key, _)), Some((next_key, _))) =
                                     (&prev_original, &next_original)
                                 {
-                                    let filled_rows_to_delete = managed_state
-                                        .scan_filled_rows_between(prev_key, next_key)
+                                    let filled_rows_to_delete = cache_manager
+                                        .scan_filled_rows_between(
+                                            prev_key,
+                                            next_key,
+                                            &managed_state,
+                                        )
                                         .await?;
 
                                     cache_manager.sync_clean_cache_entries(
@@ -950,6 +1039,7 @@ impl<S: StateStore> GapFillExecutor<S> {
                                         &interval,
                                         time_column_index,
                                         &fill_columns,
+                                        &metrics,
                                     )?;
 
                                     for filled_row in filled_rows {
@@ -978,6 +1068,7 @@ impl<S: StateStore> GapFillExecutor<S> {
                                         &interval,
                                         time_column_index,
                                         &fill_columns,
+                                        &metrics,
                                     )?;
 
                                     for filled_row in filled_rows {
@@ -1002,25 +1093,33 @@ impl<S: StateStore> GapFillExecutor<S> {
 
                                 // Find previous and next original row neighbors before deletion.
                                 let prev_original = cache_manager
-                                    .find_robust_prev_original(&cache_key, &managed_state)
+                                    .find_prev_original(&cache_key, &managed_state)
                                     .await?;
                                 let next_original = cache_manager
-                                    .find_robust_next_original(&cache_key, &managed_state)
+                                    .find_next_original(&cache_key, &managed_state)
                                     .await?;
 
                                 // Delete fill rows on both sides of the row to be deleted.
                                 let mut filled_rows_to_delete = Vec::new();
 
                                 if let Some((prev_key, _)) = &prev_original {
-                                    let fills_left = managed_state
-                                        .scan_filled_rows_between(prev_key, &cache_key)
+                                    let fills_left = cache_manager
+                                        .scan_filled_rows_between(
+                                            prev_key,
+                                            &cache_key,
+                                            &managed_state,
+                                        )
                                         .await?;
                                     filled_rows_to_delete.extend(fills_left);
                                 }
 
                                 if let Some((next_key, _)) = &next_original {
-                                    let fills_right = managed_state
-                                        .scan_filled_rows_between(&cache_key, next_key)
+                                    let fills_right = cache_manager
+                                        .scan_filled_rows_between(
+                                            &cache_key,
+                                            next_key,
+                                            &managed_state,
+                                        )
                                         .await?;
                                     filled_rows_to_delete.extend(fills_right);
                                 }
@@ -1063,6 +1162,7 @@ impl<S: StateStore> GapFillExecutor<S> {
                                         &interval,
                                         time_column_index,
                                         &fill_columns,
+                                        &metrics,
                                     )?;
 
                                     for filled_row in filled_rows {
@@ -1129,12 +1229,15 @@ mod tests {
     use crate::common::table::test_utils::gen_pbtable_with_dist_key;
     use crate::executor::test_utils::{MessageSender, MockSource};
 
+    // Use atomic counter to generate unique actor IDs for each test
+    static NEXT_ACTOR_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
     async fn create_executor(
         store: MemoryStateStore,
         fill_columns: Vec<(usize, FillStrategy)>,
         schema: Schema,
         gap_interval: Interval,
-    ) -> (MessageSender, BoxedMessageStream) {
+    ) -> (MessageSender, BoxedMessageStream, ActorContextRef) {
         let (tx, source) = MockSource::channel();
         let source = source.into_executor(schema.clone(), vec![0]);
 
@@ -1168,8 +1271,11 @@ mod tests {
 
         let time_column_index = 0;
 
+        // Generate a unique actor ID for each test to avoid metrics collision
+        let actor_id = NEXT_ACTOR_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let ctx = ActorContext::for_test(actor_id);
         let executor = GapFillExecutor::new(GapFillExecutorArgs {
-            ctx: ActorContext::for_test(123),
+            ctx: ctx.clone(),
             input: source,
             schema: schema.clone(),
             chunk_size: 1024,
@@ -1182,7 +1288,7 @@ mod tests {
             state_table: table,
         });
 
-        (tx, executor.boxed().execute())
+        (tx, executor.boxed().execute(), ctx)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1194,8 +1300,14 @@ mod tests {
             Field::unnamed(DataType::Float64),
         ]);
         let fill_columns = vec![(1, FillStrategy::Locf), (2, FillStrategy::Locf)];
-        let (mut tx, mut executor) =
+        let (mut tx, mut executor, ctx) =
             create_executor(store, fill_columns, schema, Interval::from_minutes(1)).await;
+
+        // Get metrics counter
+        let generated_rows_counter = ctx
+            .streaming_metrics
+            .gap_fill_generated_rows_count
+            .with_guarded_label_values(&[&ctx.id.to_string(), &ctx.fragment_id.to_string()]);
 
         // Init with barrier.
         tx.push_barrier(test_epoch(1), false);
@@ -1244,6 +1356,9 @@ mod tests {
             );
         }
 
+        // Verify metrics: 2 filled rows (00:01:00 and 00:02:00)
+        assert_eq!(generated_rows_counter.get(), 2);
+
         // 2. Send a new chunk that arrives out-of-order, landing in the previously filled gap.
         // This tests if the executor can correctly retract old filled rows and create new ones.
         tx.push_chunk(StreamChunk::from_pretty(
@@ -1270,6 +1385,9 @@ mod tests {
 
         assert_eq!(chunk2.sort_rows(), expected2.sort_rows());
 
+        // Verify metrics: counter accumulates, so after regenerating fills it increases
+        assert_eq!(generated_rows_counter.get(), 3); // 2 initial + 1 refilled (00:01:00)
+
         // 3. Send a delete chunk to remove an original data point.
         // This should trigger retraction of old fills and generation of new ones.
         tx.push_chunk(StreamChunk::from_pretty(
@@ -1295,6 +1413,9 @@ mod tests {
             )
             .sort_rows()
         );
+
+        // Verify metrics: 3 + 2 more refilled rows (00:01:00 and 00:02:00)
+        assert_eq!(generated_rows_counter.get(), 5);
 
         // 4. Send an update chunk to modify an original data point.
         // This should also trigger retraction and re-generation of fills.
@@ -1326,6 +1447,9 @@ mod tests {
             )
             .sort_rows()
         );
+
+        // Verify metrics: 5 + 2 more refilled rows (regenerated 00:01:00 and 00:02:00)
+        assert_eq!(generated_rows_counter.get(), 7);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1337,8 +1461,14 @@ mod tests {
             Field::unnamed(DataType::Float64),
         ]);
         let fill_columns = vec![(1, FillStrategy::Null), (2, FillStrategy::Null)];
-        let (mut tx, mut executor) =
+        let (mut tx, mut executor, ctx) =
             create_executor(store, fill_columns, schema, Interval::from_minutes(1)).await;
+
+        // Get metrics counter
+        let generated_rows_counter = ctx
+            .streaming_metrics
+            .gap_fill_generated_rows_count
+            .with_guarded_label_values(&[&ctx.id.to_string(), &ctx.fragment_id.to_string()]);
 
         // Init with barrier.
         tx.push_barrier(test_epoch(1), false);
@@ -1370,6 +1500,9 @@ mod tests {
             .sort_rows()
         );
 
+        // Verify metrics: 2 filled rows (00:01:00 and 00:02:00)
+        assert_eq!(generated_rows_counter.get(), 2);
+
         // 2. Send a new chunk that arrives out-of-order, landing in the previously filled gap.
         tx.push_chunk(StreamChunk::from_pretty(
             " TS                  i   F
@@ -1395,6 +1528,9 @@ mod tests {
             .sort_rows()
         );
 
+        // Verify metrics: 2 + 1 refilled (00:01:00) = 3
+        assert_eq!(generated_rows_counter.get(), 3);
+
         // 3. Send a delete chunk to remove an original data point.
         tx.push_chunk(StreamChunk::from_pretty(
             " TS                  i   F
@@ -1419,6 +1555,9 @@ mod tests {
             )
             .sort_rows()
         );
+
+        // Verify metrics: 3 + 2 refilled = 5
+        assert_eq!(generated_rows_counter.get(), 5);
 
         // 4. Send an update chunk to modify an original data point.
         tx.push_chunk(StreamChunk::from_pretty(
@@ -1447,6 +1586,9 @@ mod tests {
             )
             .sort_rows()
         );
+
+        // Verify metrics: 5 + 2 refilled = 7
+        assert_eq!(generated_rows_counter.get(), 7);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1461,8 +1603,14 @@ mod tests {
             (1, FillStrategy::Interpolate),
             (2, FillStrategy::Interpolate),
         ];
-        let (mut tx, mut executor) =
+        let (mut tx, mut executor, ctx) =
             create_executor(store, fill_columns, schema, Interval::from_minutes(1)).await;
+
+        // Get metrics counter
+        let generated_rows_counter = ctx
+            .streaming_metrics
+            .gap_fill_generated_rows_count
+            .with_guarded_label_values(&[&ctx.id.to_string(), &ctx.fragment_id.to_string()]);
 
         // Init with barrier.
         tx.push_barrier(test_epoch(1), false);
@@ -1494,6 +1642,9 @@ mod tests {
             .sort_rows()
         );
 
+        // Verify metrics: 2 filled rows (00:01:00 and 00:02:00)
+        assert_eq!(generated_rows_counter.get(), 2);
+
         // 2. Send a new chunk that arrives out-of-order, landing in the previously filled gap.
         tx.push_chunk(StreamChunk::from_pretty(
             " TS                  i   F
@@ -1518,6 +1669,9 @@ mod tests {
             )
             .sort_rows()
         );
+
+        // Verify metrics: 2 + 1 refilled (00:01:00) = 3
+        assert_eq!(generated_rows_counter.get(), 3);
 
         // 3. Send a delete chunk to remove an original data point.
         // This should trigger retraction of old fills and re-calculation of interpolated values.
@@ -1544,6 +1698,9 @@ mod tests {
             )
             .sort_rows()
         );
+
+        // Verify metrics: 3 + 2 refilled = 5
+        assert_eq!(generated_rows_counter.get(), 5);
 
         // 4. Send an update chunk to modify an original data point.
         // This will cause the interpolated values to be re-calculated.
@@ -1573,6 +1730,9 @@ mod tests {
             )
             .sort_rows()
         );
+
+        // Verify metrics: 5 + 2 refilled = 7
+        assert_eq!(generated_rows_counter.get(), 7);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1586,13 +1746,19 @@ mod tests {
         let fill_columns = vec![(1, FillStrategy::Locf), (2, FillStrategy::Interpolate)];
 
         // --- First run ---
-        let (mut tx, mut executor) = create_executor(
+        let (mut tx, mut executor, ctx) = create_executor(
             store.clone(),
             fill_columns.clone(),
             schema.clone(),
             Interval::from_minutes(1),
         )
         .await;
+
+        // Get metrics counter for first executor
+        let generated_rows_counter = ctx
+            .streaming_metrics
+            .gap_fill_generated_rows_count
+            .with_guarded_label_values(&[&ctx.id.to_string(), &ctx.fragment_id.to_string()]);
 
         // Init with barrier.
         tx.push_barrier(test_epoch(1), false);
@@ -1625,17 +1791,26 @@ mod tests {
             .sort_rows()
         );
 
+        // Verify metrics after first run: 2 filled rows (00:01:00 and 00:02:00)
+        assert_eq!(generated_rows_counter.get(), 2);
+
         tx.push_barrier(test_epoch(2), false);
         executor.next().await.unwrap().unwrap(); // Barrier to commit.
 
         // --- Second run (after recovery) ---
-        let (mut tx2, mut executor2) = create_executor(
+        let (mut tx2, mut executor2, ctx2) = create_executor(
             store.clone(),
             fill_columns.clone(),
             schema.clone(),
             Interval::from_minutes(1),
         )
         .await;
+
+        // Get metrics counter for second executor (new instance)
+        let generated_rows_counter2 = ctx2
+            .streaming_metrics
+            .gap_fill_generated_rows_count
+            .with_guarded_label_values(&[&ctx2.id.to_string(), &ctx2.fragment_id.to_string()]);
 
         // Init with barrier, which triggers recovery.
         tx2.push_barrier(test_epoch(2), false);
@@ -1665,6 +1840,9 @@ mod tests {
             )
             .sort_rows()
         );
+
+        // Verify metrics after recovery: 1 filled row (00:04:00)
+        assert_eq!(generated_rows_counter2.get(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1685,8 +1863,14 @@ mod tests {
             (4, FillStrategy::Interpolate),
         ];
         let gap_interval = Interval::from_days(1);
-        let (mut tx, mut executor) =
+        let (mut tx, mut executor, ctx) =
             create_executor(store, fill_columns, schema, gap_interval).await;
+
+        // Get metrics counter
+        let generated_rows_counter = ctx
+            .streaming_metrics
+            .gap_fill_generated_rows_count
+            .with_guarded_label_values(&[&ctx.id.to_string(), &ctx.fragment_id.to_string()]);
 
         // Init with barrier.
         tx.push_barrier(test_epoch(1), false);
@@ -1719,6 +1903,9 @@ mod tests {
             .sort_rows()
         );
 
+        // Verify metrics: 3 filled rows (04-02, 04-03, 04-04)
+        assert_eq!(generated_rows_counter.get(), 3);
+
         // 2. Send a new chunk that arrives out-of-order, landing in the previously filled gap.
         tx.push_chunk(StreamChunk::from_pretty(
             " TS                  i   I    f     F
@@ -1746,6 +1933,9 @@ mod tests {
             .sort_rows()
         );
 
+        // Verify metrics: 3 + 2 refilled (04-02, 04-04) = 5
+        assert_eq!(generated_rows_counter.get(), 5);
+
         // 3. Send a delete chunk to remove an original data point.
         tx.push_chunk(StreamChunk::from_pretty(
             " TS                  i   I    f     F
@@ -1771,6 +1961,9 @@ mod tests {
             )
             .sort_rows()
         );
+
+        // Verify metrics: 5 + 3 refilled = 8
+        assert_eq!(generated_rows_counter.get(), 8);
 
         // 4. Send an update chunk to modify an original data point.
         tx.push_chunk(StreamChunk::from_pretty(
@@ -1800,5 +1993,8 @@ mod tests {
             )
             .sort_rows()
         );
+
+        // Verify metrics: 8 + 3 refilled = 11
+        assert_eq!(generated_rows_counter.get(), 11);
     }
 }

@@ -104,12 +104,12 @@ impl<S: StateStore> ExecutorInner<S> {
         };
     }
 
-    async fn generate_filled_rows(
+    fn generate_filled_rows(
         prev_row: &OwnedRow,
         curr_row: &OwnedRow,
         time_column_index: usize,
         fill_columns: &[(usize, FillStrategy)],
-        gap_interval: &NonStrictExpression,
+        interval: risingwave_common::types::Interval,
     ) -> Result<Vec<OwnedRow>, ExprError> {
         let mut filled_rows = Vec::new();
         let (Some(prev_time_scalar), Some(curr_time_scalar)) = (
@@ -162,84 +162,108 @@ impl<S: StateStore> ExecutorInner<S> {
             return Ok(filled_rows);
         }
 
-        let dummy_row = OwnedRow::new(vec![]);
-        let interval_result = gap_interval.eval_row_infallible(&dummy_row).await;
-        let interval = match interval_result {
-            Some(ScalarImpl::Interval(interval)) => interval,
-            val => {
-                warn!(
-                    "Failed to evaluate the interval expression, expected interval, got {:?}. Skipping gap fill.",
-                    val
-                );
-                return Ok(filled_rows);
-            }
-        };
-
-        let mut fill_values: Vec<Datum> = Vec::with_capacity(prev_row.len());
-        for i in 0..prev_row.len() {
-            if i == time_column_index {
-                fill_values.push(None);
-            } else if let Some((_, strategy)) = fill_columns.iter().find(|(col, _)| *col == i) {
-                match strategy {
-                    FillStrategy::Locf | FillStrategy::Interpolate => {
-                        fill_values.push(prev_row.datum_at(i).to_owned_datum())
-                    }
-                    FillStrategy::Null => fill_values.push(None),
-                }
-            } else {
-                fill_values.push(prev_row.datum_at(i).to_owned_datum());
-            }
-        }
-        let row_template: Vec<Datum> = fill_values;
         let mut fill_time = match prev_time.checked_add(interval) {
             Some(t) => t,
             None => {
                 return Ok(filled_rows);
             }
         };
+        if fill_time >= curr_time {
+            return Ok(filled_rows);
+        }
 
-        let mut data = Vec::new();
-        while fill_time < curr_time {
-            let mut new_row_data = row_template.clone();
-            let fill_time_scalar = match prev_time_scalar {
-                ScalarRefImpl::Timestamp(_) => ScalarImpl::Timestamp(fill_time),
-                ScalarRefImpl::Timestamptz(_) => {
-                    let micros = fill_time.0.and_utc().timestamp_micros();
-                    ScalarImpl::Timestamptz(risingwave_common::types::Timestamptz::from_micros(
-                        micros,
-                    ))
-                }
-                _ => unreachable!("Time column should be Timestamp or Timestamptz"),
+        // Calculate the number of rows to fill
+        let mut row_count = 0;
+        let mut temp_time = fill_time;
+        while temp_time < curr_time {
+            row_count += 1;
+            temp_time = match temp_time.checked_add(interval) {
+                Some(t) => t,
+                None => break,
             };
-            new_row_data[time_column_index] = Some(fill_time_scalar);
-            data.push(new_row_data);
+        }
+
+        // Pre-compute interpolation steps for each column that requires interpolation
+        let mut interpolation_steps: Vec<Option<ScalarImpl>> = Vec::new();
+        let mut interpolation_states: Vec<Datum> = Vec::new();
+
+        for i in 0..prev_row.len() {
+            if let Some((_, strategy)) = fill_columns.iter().find(|(col, _)| *col == i) {
+                if matches!(strategy, FillStrategy::Interpolate) {
+                    let step = Self::calculate_step(
+                        prev_row.datum_at(i),
+                        curr_row.datum_at(i),
+                        row_count + 1,
+                    );
+                    interpolation_steps.push(step.clone());
+                    interpolation_states.push(prev_row.datum_at(i).to_owned_datum());
+                } else {
+                    interpolation_steps.push(None);
+                    interpolation_states.push(None);
+                }
+            } else {
+                interpolation_steps.push(None);
+                interpolation_states.push(None);
+            }
+        }
+
+        // Generate filled rows, applying the appropriate strategy for each column
+        while fill_time < curr_time {
+            let mut new_row_data = Vec::with_capacity(prev_row.len());
+
+            for col_idx in 0..prev_row.len() {
+                let datum = if col_idx == time_column_index {
+                    // Time column: use the incremented timestamp
+                    let fill_time_scalar = match prev_time_scalar {
+                        ScalarRefImpl::Timestamp(_) => ScalarImpl::Timestamp(fill_time),
+                        ScalarRefImpl::Timestamptz(_) => {
+                            let micros = fill_time.0.and_utc().timestamp_micros();
+                            ScalarImpl::Timestamptz(
+                                risingwave_common::types::Timestamptz::from_micros(micros),
+                            )
+                        }
+                        _ => unreachable!("Time column should be Timestamp or Timestamptz"),
+                    };
+                    Some(fill_time_scalar)
+                } else if let Some((_, strategy)) =
+                    fill_columns.iter().find(|(col, _)| *col == col_idx)
+                {
+                    // Apply the fill strategy for this column
+                    match strategy {
+                        FillStrategy::Locf => prev_row.datum_at(col_idx).to_owned_datum(),
+                        FillStrategy::Null => None,
+                        FillStrategy::Interpolate => {
+                            // Apply interpolation step and update cumulative value
+                            if let Some(step) = &interpolation_steps[col_idx] {
+                                Self::apply_step(&mut interpolation_states[col_idx], step);
+                                interpolation_states[col_idx].clone()
+                            } else {
+                                prev_row.datum_at(col_idx).to_owned_datum()
+                            }
+                        }
+                    }
+                } else {
+                    // No strategy specified, use the value from previous row
+                    prev_row.datum_at(col_idx).to_owned_datum()
+                };
+                new_row_data.push(datum);
+            }
+
+            filled_rows.push(OwnedRow::new(new_row_data));
+
             fill_time = match fill_time.checked_add(interval) {
                 Some(t) => t,
                 None => {
+                    // Time overflow during iteration, stop filling
+                    warn!(
+                        "Gap fill stopped due to timestamp overflow after generating {} rows.",
+                        filled_rows.len()
+                    );
                     break;
                 }
             };
         }
-        for (col_idx, strategy) in fill_columns {
-            if matches!(strategy, FillStrategy::Interpolate) {
-                let steps = data.len();
-                let step = Self::calculate_step(
-                    prev_row.datum_at(*col_idx),
-                    curr_row.datum_at(*col_idx),
-                    steps + 1,
-                );
-                if let Some(step) = step {
-                    for (i, row) in data.iter_mut().enumerate() {
-                        for _ in 0..=i {
-                            Self::apply_step(&mut row[*col_idx], &step);
-                        }
-                    }
-                }
-            }
-        }
-        for row in data {
-            filled_rows.push(OwnedRow::new(row));
-        }
+
         Ok(filled_rows)
     }
 }
@@ -283,6 +307,18 @@ impl<S: StateStore> EowcGapFillExecutor<S> {
         this.buffer_table.init_epoch(first_epoch).await?;
         this.prev_row_table.init_epoch(first_epoch).await?;
 
+        // Calculate and validate gap interval once at initialization
+        let dummy_row = OwnedRow::new(vec![]);
+        let interval_datum = this.gap_interval.eval_row_infallible(&dummy_row).await;
+        let interval = interval_datum
+            .ok_or_else(|| anyhow::anyhow!("Gap interval expression returned null"))?
+            .into_interval();
+
+        // Validate that gap interval is not zero
+        if interval.months() == 0 && interval.days() == 0 && interval.usecs() == 0 {
+            Err(anyhow::anyhow!("Gap interval cannot be zero"))?;
+        }
+
         let mut vars = ExecutionVars {
             buffer: SortBuffer::new(this.time_column_index, &this.buffer_table),
         };
@@ -313,9 +349,8 @@ impl<S: StateStore> EowcGapFillExecutor<S> {
                                 &current_row,
                                 this.time_column_index,
                                 &this.fill_columns,
-                                &this.gap_interval,
-                            )
-                            .await?;
+                                interval,
+                            )?;
                             for filled_row in filled_rows {
                                 if let Some(chunk) =
                                     chunk_builder.append_row(Op::Insert, &filled_row)

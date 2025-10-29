@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use risingwave_common::array::Op;
+use risingwave_common::metrics::LabelGuardedIntCounter;
 use risingwave_common::row::OwnedRow;
 use risingwave_common::types::{CheckedAdd, Decimal, ToOwnedDatum};
 use risingwave_expr::ExprError;
@@ -43,6 +44,10 @@ pub struct EowcGapFillExecutorArgs<S: StateStore> {
     pub gap_interval: NonStrictExpression,
 }
 
+pub struct GapFillMetrics {
+    pub gap_fill_generated_rows_count: LabelGuardedIntCounter,
+}
+
 struct ExecutorInner<S: StateStore> {
     actor_ctx: ActorContextRef,
 
@@ -53,6 +58,9 @@ struct ExecutorInner<S: StateStore> {
     time_column_index: usize,
     fill_columns: Vec<(usize, FillStrategy)>,
     gap_interval: NonStrictExpression,
+
+    // Metrics
+    metrics: GapFillMetrics,
 }
 
 struct ExecutionVars<S: StateStore> {
@@ -110,6 +118,7 @@ impl<S: StateStore> ExecutorInner<S> {
         time_column_index: usize,
         fill_columns: &[(usize, FillStrategy)],
         interval: risingwave_common::types::Interval,
+        metrics: &GapFillMetrics,
     ) -> Result<Vec<OwnedRow>, ExprError> {
         let mut filled_rows = Vec::new();
         let (Some(prev_time_scalar), Some(curr_time_scalar)) = (
@@ -264,18 +273,32 @@ impl<S: StateStore> ExecutorInner<S> {
             };
         }
 
+        // Update metrics with the number of generated rows
+        metrics
+            .gap_fill_generated_rows_count
+            .inc_by(filled_rows.len() as u64);
+
         Ok(filled_rows)
     }
 }
 
 impl<S: StateStore> Execute for EowcGapFillExecutor<S> {
     fn execute(self: Box<Self>) -> BoxedMessageStream {
-        self.executor_inner().boxed()
+        self.execute_inner().boxed()
     }
 }
 
 impl<S: StateStore> EowcGapFillExecutor<S> {
     pub fn new(args: EowcGapFillExecutorArgs<S>) -> Self {
+        let metrics = args.actor_ctx.streaming_metrics.clone();
+        let actor_id = args.actor_ctx.id.to_string();
+        let fragment_id = args.actor_ctx.fragment_id.to_string();
+        let gap_fill_metrics = GapFillMetrics {
+            gap_fill_generated_rows_count: metrics
+                .gap_fill_generated_rows_count
+                .with_guarded_label_values(&[&actor_id, &fragment_id]),
+        };
+
         Self {
             input: args.input,
 
@@ -288,12 +311,13 @@ impl<S: StateStore> EowcGapFillExecutor<S> {
                 time_column_index: args.time_column_index,
                 fill_columns: args.fill_columns,
                 gap_interval: args.gap_interval,
+                metrics: gap_fill_metrics,
             },
         }
     }
 
     #[try_stream(ok = Message, error = StreamExecutorError)]
-    async fn executor_inner(self) {
+    async fn execute_inner(self) {
         let Self {
             input,
             inner: mut this,
@@ -350,6 +374,7 @@ impl<S: StateStore> EowcGapFillExecutor<S> {
                                 this.time_column_index,
                                 &this.fill_columns,
                                 interval,
+                                &this.metrics,
                             )?;
                             for filled_row in filled_rows {
                                 if let Some(chunk) =
@@ -422,12 +447,14 @@ mod tests {
     use crate::common::table::test_utils::gen_pbtable_with_dist_key;
     use crate::executor::test_utils::{MessageSender, MockSource, StreamExecutorTestExt};
 
+    static NEXT_ACTOR_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
     async fn create_executor<S: StateStore>(
         time_column_index: usize,
         fill_columns: Vec<(usize, FillStrategy)>,
         gap_interval: NonStrictExpression,
         store: S,
-    ) -> (MessageSender, BoxedMessageStream) {
+    ) -> (MessageSender, BoxedMessageStream, ActorContextRef) {
         let input_schema = Schema::new(vec![
             Field::unnamed(DataType::Timestamp),
             Field::unnamed(DataType::Int32),
@@ -479,8 +506,13 @@ mod tests {
 
         let (tx, source) = MockSource::channel();
         let source = source.into_executor(input_schema, input_pk_indices);
+
+        // Generate a unique actor ID for each test to avoid metrics collision
+        let actor_id = NEXT_ACTOR_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let ctx = ActorContext::for_test(actor_id);
+
         let gap_fill_executor = EowcGapFillExecutor::new(EowcGapFillExecutorArgs {
-            actor_ctx: ActorContext::for_test(123),
+            actor_ctx: ctx.clone(),
             schema: source.schema().clone(),
             input: source,
             buffer_table,
@@ -491,7 +523,7 @@ mod tests {
             gap_interval,
         });
 
-        (tx, gap_fill_executor.boxed().execute())
+        (tx, gap_fill_executor.boxed().execute(), ctx)
     }
 
     #[tokio::test]
@@ -505,7 +537,7 @@ mod tests {
             (4, FillStrategy::Interpolate),
         ];
         let store = MemoryStateStore::new();
-        let (mut tx, mut gap_fill_executor) = create_executor(
+        let (mut tx, mut gap_fill_executor, ctx) = create_executor(
             time_column_index,
             fill_columns,
             NonStrictExpression::for_test(LiteralExpression::new(
@@ -515,6 +547,12 @@ mod tests {
             store.clone(),
         )
         .await;
+
+        // Get metrics counter
+        let generated_rows_counter = ctx
+            .streaming_metrics
+            .gap_fill_generated_rows_count
+            .with_guarded_label_values(&[&ctx.id.to_string(), &ctx.fragment_id.to_string()]);
 
         tx.push_barrier(test_epoch(1), false);
         gap_fill_executor.expect_barrier().await;
@@ -559,6 +597,9 @@ mod tests {
             )
         );
         gap_fill_executor.expect_watermark().await;
+
+        // Verify metrics: 3 filled rows (04-02, 04-03, 04-04)
+        assert_eq!(generated_rows_counter.get(), 3);
     }
 
     #[tokio::test]
@@ -572,7 +613,7 @@ mod tests {
             (4, FillStrategy::Locf),
         ];
         let store = MemoryStateStore::new();
-        let (mut tx, mut gap_fill_executor) = create_executor(
+        let (mut tx, mut gap_fill_executor, ctx) = create_executor(
             time_column_index,
             fill_columns,
             NonStrictExpression::for_test(LiteralExpression::new(
@@ -582,6 +623,12 @@ mod tests {
             store.clone(),
         )
         .await;
+
+        // Get metrics counter
+        let generated_rows_counter = ctx
+            .streaming_metrics
+            .gap_fill_generated_rows_count
+            .with_guarded_label_values(&[&ctx.id.to_string(), &ctx.fragment_id.to_string()]);
 
         tx.push_barrier(test_epoch(1), false);
         gap_fill_executor.expect_barrier().await;
@@ -626,6 +673,9 @@ mod tests {
             )
         );
         gap_fill_executor.expect_watermark().await;
+
+        // Verify metrics: 3 filled rows (04-02, 04-03, 04-04)
+        assert_eq!(generated_rows_counter.get(), 3);
     }
 
     #[tokio::test]
@@ -639,7 +689,7 @@ mod tests {
             (4, FillStrategy::Null),
         ];
         let store = MemoryStateStore::new();
-        let (mut tx, mut gap_fill_executor) = create_executor(
+        let (mut tx, mut gap_fill_executor, ctx) = create_executor(
             time_column_index,
             fill_columns,
             NonStrictExpression::for_test(LiteralExpression::new(
@@ -649,6 +699,12 @@ mod tests {
             store.clone(),
         )
         .await;
+
+        // Get metrics counter
+        let generated_rows_counter = ctx
+            .streaming_metrics
+            .gap_fill_generated_rows_count
+            .with_guarded_label_values(&[&ctx.id.to_string(), &ctx.fragment_id.to_string()]);
 
         tx.push_barrier(test_epoch(1), false);
         gap_fill_executor.expect_barrier().await;
@@ -693,6 +749,9 @@ mod tests {
             )
         );
         gap_fill_executor.expect_watermark().await;
+
+        // Verify metrics: 3 filled rows (04-02, 04-03, 04-04)
+        assert_eq!(generated_rows_counter.get(), 3);
     }
 
     #[tokio::test]
@@ -706,7 +765,7 @@ mod tests {
             (4, FillStrategy::Interpolate),
         ];
         let store = MemoryStateStore::new();
-        let (mut tx, mut gap_fill_executor) = create_executor(
+        let (mut tx, mut gap_fill_executor, ctx) = create_executor(
             time_column_index,
             fill_columns,
             NonStrictExpression::for_test(LiteralExpression::new(
@@ -716,6 +775,12 @@ mod tests {
             store.clone(),
         )
         .await;
+
+        // Get metrics counter
+        let generated_rows_counter = ctx
+            .streaming_metrics
+            .gap_fill_generated_rows_count
+            .with_guarded_label_values(&[&ctx.id.to_string(), &ctx.fragment_id.to_string()]);
 
         tx.push_barrier(test_epoch(1), false);
         gap_fill_executor.expect_barrier().await;
@@ -760,6 +825,9 @@ mod tests {
             )
         );
         gap_fill_executor.expect_watermark().await;
+
+        // Verify metrics: 3 filled rows (04-02, 04-03, 04-04)
+        assert_eq!(generated_rows_counter.get(), 3);
     }
 
     #[tokio::test]
@@ -773,7 +841,7 @@ mod tests {
             (4, FillStrategy::Locf),
         ];
         let store = MemoryStateStore::new();
-        let (mut tx, mut gap_fill_executor) = create_executor(
+        let (mut tx, mut gap_fill_executor, ctx) = create_executor(
             time_column_index,
             fill_columns.clone(),
             NonStrictExpression::for_test(LiteralExpression::new(
@@ -783,6 +851,12 @@ mod tests {
             store.clone(),
         )
         .await;
+
+        // Get metrics counter for first executor
+        let generated_rows_counter = ctx
+            .streaming_metrics
+            .gap_fill_generated_rows_count
+            .with_guarded_label_values(&[&ctx.id.to_string(), &ctx.fragment_id.to_string()]);
 
         tx.push_barrier(test_epoch(1), false);
         gap_fill_executor.expect_barrier().await;
@@ -796,7 +870,10 @@ mod tests {
         tx.push_barrier(test_epoch(2), false);
         gap_fill_executor.expect_barrier().await;
 
-        let (mut recovered_tx, mut recovered_gap_fill_executor) = create_executor(
+        // No fills generated in first run (no watermark yet)
+        assert_eq!(generated_rows_counter.get(), 0);
+
+        let (mut recovered_tx, mut recovered_gap_fill_executor, ctx2) = create_executor(
             time_column_index,
             fill_columns.clone(),
             NonStrictExpression::for_test(LiteralExpression::new(
@@ -806,6 +883,12 @@ mod tests {
             store.clone(),
         )
         .await;
+
+        // Get metrics counter for recovered executor (new instance)
+        let generated_rows_counter2 = ctx2
+            .streaming_metrics
+            .gap_fill_generated_rows_count
+            .with_guarded_label_values(&[&ctx2.id.to_string(), &ctx2.fragment_id.to_string()]);
 
         recovered_tx.push_barrier(test_epoch(2), false);
         recovered_gap_fill_executor.expect_barrier().await;
@@ -834,6 +917,9 @@ mod tests {
 
         recovered_gap_fill_executor.expect_watermark().await;
 
+        // Verify metrics after first recovery: 3 filled rows (04-02, 04-03, 04-04)
+        assert_eq!(generated_rows_counter2.get(), 3);
+
         recovered_tx.push_chunk(StreamChunk::from_pretty(
             " TS                  i   I    f     F
             + 2023-04-08T10:00:00 80 500 8.0 500.0",
@@ -842,16 +928,23 @@ mod tests {
         recovered_tx.push_barrier(test_epoch(3), false);
         recovered_gap_fill_executor.expect_barrier().await;
 
-        let (mut final_recovered_tx, mut final_recovered_gap_fill_executor) = create_executor(
-            time_column_index,
-            fill_columns,
-            NonStrictExpression::for_test(LiteralExpression::new(
-                DataType::Interval,
-                Some(gap_interval.into()),
-            )),
-            store,
-        )
-        .await;
+        let (mut final_recovered_tx, mut final_recovered_gap_fill_executor, ctx3) =
+            create_executor(
+                time_column_index,
+                fill_columns,
+                NonStrictExpression::for_test(LiteralExpression::new(
+                    DataType::Interval,
+                    Some(gap_interval.into()),
+                )),
+                store,
+            )
+            .await;
+
+        // Get metrics counter for final recovered executor (new instance)
+        let generated_rows_counter3 = ctx3
+            .streaming_metrics
+            .gap_fill_generated_rows_count
+            .with_guarded_label_values(&[&ctx3.id.to_string(), &ctx3.fragment_id.to_string()]);
 
         final_recovered_tx.push_barrier(test_epoch(3), false);
         final_recovered_gap_fill_executor.expect_barrier().await;
@@ -877,5 +970,8 @@ mod tests {
         );
 
         final_recovered_gap_fill_executor.expect_watermark().await;
+
+        // Verify metrics after final recovery: 2 filled rows (04-06, 04-07)
+        assert_eq!(generated_rows_counter3.get(), 2);
     }
 }

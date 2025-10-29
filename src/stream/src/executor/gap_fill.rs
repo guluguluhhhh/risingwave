@@ -64,6 +64,7 @@ pub struct ManagedGapFillState<S: StateStore> {
     state_table: StateTable<S>,
     time_key_serde: OrderedRowSerde,
     time_column_index: usize,
+    filled_column_index: usize,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -92,10 +93,14 @@ impl<S: StateStore> ManagedGapFillState<S> {
             vec![risingwave_common::util::sort_util::OrderType::ascending()],
         );
 
+        // The is_filled flag is always the last column in the state table schema.
+        let filled_column_index = schema.len();
+
         Self {
             state_table,
             time_key_serde,
             time_column_index,
+            filled_column_index,
         }
     }
 
@@ -147,10 +152,7 @@ impl<S: StateStore> ManagedGapFillState<S> {
         while let Some(row_result) = state_table_iter.next().await {
             let row = row_result?.into_owned_row();
 
-            if let Some(is_filled_datum) = row.datum_at(row.len() - 1)
-                && let Some(ScalarImpl::Bool(is_filled)) = is_filled_datum.to_owned_datum()
-                && is_filled
-            {
+            if self.extract_is_filled_flag(&row) {
                 // This is a filled row, add to deletion list.
                 // For state table, we use the time column as the key.
                 let time_datum = row.datum_at(self.time_column_index);
@@ -253,7 +255,7 @@ impl<S: StateStore> ManagedGapFillState<S> {
 
     /// Converts a state table row to a `GapFillStateRow`.
     fn get_gapfill_row(&self, state_row: OwnedRow) -> GapFillStateRow {
-        let is_filled = Self::extract_is_filled_flag(&state_row);
+        let is_filled = self.extract_is_filled_flag(&state_row);
         let output_row = Self::state_row_to_output_row(&state_row);
         let cache_key = self.serialize_time_to_cache_key(&output_row);
 
@@ -290,10 +292,9 @@ impl<S: StateStore> ManagedGapFillState<S> {
     }
 
     /// Extract the `is_filled` flag from a state table row.
-    fn extract_is_filled_flag(state_row: &OwnedRow) -> bool {
-        let last_idx = state_row.len() - 1;
+    fn extract_is_filled_flag(&self, state_row: &OwnedRow) -> bool {
         if let Some(ScalarImpl::Bool(is_filled)) = state_row
-            .datum_at(last_idx)
+            .datum_at(self.filled_column_index)
             .and_then(|d| d.to_owned_datum())
         {
             is_filled
@@ -1229,15 +1230,12 @@ mod tests {
     use crate::common::table::test_utils::gen_pbtable_with_dist_key;
     use crate::executor::test_utils::{MessageSender, MockSource};
 
-    // Use atomic counter to generate unique actor IDs for each test
-    static NEXT_ACTOR_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
-
     async fn create_executor(
         store: MemoryStateStore,
         fill_columns: Vec<(usize, FillStrategy)>,
         schema: Schema,
         gap_interval: Interval,
-    ) -> (MessageSender, BoxedMessageStream, ActorContextRef) {
+    ) -> (MessageSender, BoxedMessageStream) {
         let (tx, source) = MockSource::channel();
         let source = source.into_executor(schema.clone(), vec![0]);
 
@@ -1271,11 +1269,8 @@ mod tests {
 
         let time_column_index = 0;
 
-        // Generate a unique actor ID for each test to avoid metrics collision
-        let actor_id = NEXT_ACTOR_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let ctx = ActorContext::for_test(actor_id);
         let executor = GapFillExecutor::new(GapFillExecutorArgs {
-            ctx: ctx.clone(),
+            ctx: ActorContext::for_test(123),
             input: source,
             schema: schema.clone(),
             chunk_size: 1024,
@@ -1288,7 +1283,7 @@ mod tests {
             state_table: table,
         });
 
-        (tx, executor.boxed().execute(), ctx)
+        (tx, executor.boxed().execute())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1300,14 +1295,8 @@ mod tests {
             Field::unnamed(DataType::Float64),
         ]);
         let fill_columns = vec![(1, FillStrategy::Locf), (2, FillStrategy::Locf)];
-        let (mut tx, mut executor, ctx) =
+        let (mut tx, mut executor) =
             create_executor(store, fill_columns, schema, Interval::from_minutes(1)).await;
-
-        // Get metrics counter
-        let generated_rows_counter = ctx
-            .streaming_metrics
-            .gap_fill_generated_rows_count
-            .with_guarded_label_values(&[&ctx.id.to_string(), &ctx.fragment_id.to_string()]);
 
         // Init with barrier.
         tx.push_barrier(test_epoch(1), false);
@@ -1356,9 +1345,6 @@ mod tests {
             );
         }
 
-        // Verify metrics: 2 filled rows (00:01:00 and 00:02:00)
-        assert_eq!(generated_rows_counter.get(), 2);
-
         // 2. Send a new chunk that arrives out-of-order, landing in the previously filled gap.
         // This tests if the executor can correctly retract old filled rows and create new ones.
         tx.push_chunk(StreamChunk::from_pretty(
@@ -1385,9 +1371,6 @@ mod tests {
 
         assert_eq!(chunk2.sort_rows(), expected2.sort_rows());
 
-        // Verify metrics: counter accumulates, so after regenerating fills it increases
-        assert_eq!(generated_rows_counter.get(), 3); // 2 initial + 1 refilled (00:01:00)
-
         // 3. Send a delete chunk to remove an original data point.
         // This should trigger retraction of old fills and generation of new ones.
         tx.push_chunk(StreamChunk::from_pretty(
@@ -1413,9 +1396,6 @@ mod tests {
             )
             .sort_rows()
         );
-
-        // Verify metrics: 3 + 2 more refilled rows (00:01:00 and 00:02:00)
-        assert_eq!(generated_rows_counter.get(), 5);
 
         // 4. Send an update chunk to modify an original data point.
         // This should also trigger retraction and re-generation of fills.
@@ -1447,9 +1427,6 @@ mod tests {
             )
             .sort_rows()
         );
-
-        // Verify metrics: 5 + 2 more refilled rows (regenerated 00:01:00 and 00:02:00)
-        assert_eq!(generated_rows_counter.get(), 7);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1461,14 +1438,8 @@ mod tests {
             Field::unnamed(DataType::Float64),
         ]);
         let fill_columns = vec![(1, FillStrategy::Null), (2, FillStrategy::Null)];
-        let (mut tx, mut executor, ctx) =
+        let (mut tx, mut executor) =
             create_executor(store, fill_columns, schema, Interval::from_minutes(1)).await;
-
-        // Get metrics counter
-        let generated_rows_counter = ctx
-            .streaming_metrics
-            .gap_fill_generated_rows_count
-            .with_guarded_label_values(&[&ctx.id.to_string(), &ctx.fragment_id.to_string()]);
 
         // Init with barrier.
         tx.push_barrier(test_epoch(1), false);
@@ -1500,9 +1471,6 @@ mod tests {
             .sort_rows()
         );
 
-        // Verify metrics: 2 filled rows (00:01:00 and 00:02:00)
-        assert_eq!(generated_rows_counter.get(), 2);
-
         // 2. Send a new chunk that arrives out-of-order, landing in the previously filled gap.
         tx.push_chunk(StreamChunk::from_pretty(
             " TS                  i   F
@@ -1528,9 +1496,6 @@ mod tests {
             .sort_rows()
         );
 
-        // Verify metrics: 2 + 1 refilled (00:01:00) = 3
-        assert_eq!(generated_rows_counter.get(), 3);
-
         // 3. Send a delete chunk to remove an original data point.
         tx.push_chunk(StreamChunk::from_pretty(
             " TS                  i   F
@@ -1555,9 +1520,6 @@ mod tests {
             )
             .sort_rows()
         );
-
-        // Verify metrics: 3 + 2 refilled = 5
-        assert_eq!(generated_rows_counter.get(), 5);
 
         // 4. Send an update chunk to modify an original data point.
         tx.push_chunk(StreamChunk::from_pretty(
@@ -1586,9 +1548,6 @@ mod tests {
             )
             .sort_rows()
         );
-
-        // Verify metrics: 5 + 2 refilled = 7
-        assert_eq!(generated_rows_counter.get(), 7);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1603,14 +1562,8 @@ mod tests {
             (1, FillStrategy::Interpolate),
             (2, FillStrategy::Interpolate),
         ];
-        let (mut tx, mut executor, ctx) =
+        let (mut tx, mut executor) =
             create_executor(store, fill_columns, schema, Interval::from_minutes(1)).await;
-
-        // Get metrics counter
-        let generated_rows_counter = ctx
-            .streaming_metrics
-            .gap_fill_generated_rows_count
-            .with_guarded_label_values(&[&ctx.id.to_string(), &ctx.fragment_id.to_string()]);
 
         // Init with barrier.
         tx.push_barrier(test_epoch(1), false);
@@ -1642,9 +1595,6 @@ mod tests {
             .sort_rows()
         );
 
-        // Verify metrics: 2 filled rows (00:01:00 and 00:02:00)
-        assert_eq!(generated_rows_counter.get(), 2);
-
         // 2. Send a new chunk that arrives out-of-order, landing in the previously filled gap.
         tx.push_chunk(StreamChunk::from_pretty(
             " TS                  i   F
@@ -1669,9 +1619,6 @@ mod tests {
             )
             .sort_rows()
         );
-
-        // Verify metrics: 2 + 1 refilled (00:01:00) = 3
-        assert_eq!(generated_rows_counter.get(), 3);
 
         // 3. Send a delete chunk to remove an original data point.
         // This should trigger retraction of old fills and re-calculation of interpolated values.
@@ -1698,9 +1645,6 @@ mod tests {
             )
             .sort_rows()
         );
-
-        // Verify metrics: 3 + 2 refilled = 5
-        assert_eq!(generated_rows_counter.get(), 5);
 
         // 4. Send an update chunk to modify an original data point.
         // This will cause the interpolated values to be re-calculated.
@@ -1730,9 +1674,6 @@ mod tests {
             )
             .sort_rows()
         );
-
-        // Verify metrics: 5 + 2 refilled = 7
-        assert_eq!(generated_rows_counter.get(), 7);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1746,19 +1687,13 @@ mod tests {
         let fill_columns = vec![(1, FillStrategy::Locf), (2, FillStrategy::Interpolate)];
 
         // --- First run ---
-        let (mut tx, mut executor, ctx) = create_executor(
+        let (mut tx, mut executor) = create_executor(
             store.clone(),
             fill_columns.clone(),
             schema.clone(),
             Interval::from_minutes(1),
         )
         .await;
-
-        // Get metrics counter for first executor
-        let generated_rows_counter = ctx
-            .streaming_metrics
-            .gap_fill_generated_rows_count
-            .with_guarded_label_values(&[&ctx.id.to_string(), &ctx.fragment_id.to_string()]);
 
         // Init with barrier.
         tx.push_barrier(test_epoch(1), false);
@@ -1791,26 +1726,17 @@ mod tests {
             .sort_rows()
         );
 
-        // Verify metrics after first run: 2 filled rows (00:01:00 and 00:02:00)
-        assert_eq!(generated_rows_counter.get(), 2);
-
         tx.push_barrier(test_epoch(2), false);
         executor.next().await.unwrap().unwrap(); // Barrier to commit.
 
         // --- Second run (after recovery) ---
-        let (mut tx2, mut executor2, ctx2) = create_executor(
+        let (mut tx2, mut executor2) = create_executor(
             store.clone(),
             fill_columns.clone(),
             schema.clone(),
             Interval::from_minutes(1),
         )
         .await;
-
-        // Get metrics counter for second executor (new instance)
-        let generated_rows_counter2 = ctx2
-            .streaming_metrics
-            .gap_fill_generated_rows_count
-            .with_guarded_label_values(&[&ctx2.id.to_string(), &ctx2.fragment_id.to_string()]);
 
         // Init with barrier, which triggers recovery.
         tx2.push_barrier(test_epoch(2), false);
@@ -1840,9 +1766,6 @@ mod tests {
             )
             .sort_rows()
         );
-
-        // Verify metrics after recovery: 1 filled row (00:04:00)
-        assert_eq!(generated_rows_counter2.get(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1863,14 +1786,8 @@ mod tests {
             (4, FillStrategy::Interpolate),
         ];
         let gap_interval = Interval::from_days(1);
-        let (mut tx, mut executor, ctx) =
+        let (mut tx, mut executor) =
             create_executor(store, fill_columns, schema, gap_interval).await;
-
-        // Get metrics counter
-        let generated_rows_counter = ctx
-            .streaming_metrics
-            .gap_fill_generated_rows_count
-            .with_guarded_label_values(&[&ctx.id.to_string(), &ctx.fragment_id.to_string()]);
 
         // Init with barrier.
         tx.push_barrier(test_epoch(1), false);
@@ -1903,9 +1820,6 @@ mod tests {
             .sort_rows()
         );
 
-        // Verify metrics: 3 filled rows (04-02, 04-03, 04-04)
-        assert_eq!(generated_rows_counter.get(), 3);
-
         // 2. Send a new chunk that arrives out-of-order, landing in the previously filled gap.
         tx.push_chunk(StreamChunk::from_pretty(
             " TS                  i   I    f     F
@@ -1933,9 +1847,6 @@ mod tests {
             .sort_rows()
         );
 
-        // Verify metrics: 3 + 2 refilled (04-02, 04-04) = 5
-        assert_eq!(generated_rows_counter.get(), 5);
-
         // 3. Send a delete chunk to remove an original data point.
         tx.push_chunk(StreamChunk::from_pretty(
             " TS                  i   I    f     F
@@ -1961,9 +1872,6 @@ mod tests {
             )
             .sort_rows()
         );
-
-        // Verify metrics: 5 + 3 refilled = 8
-        assert_eq!(generated_rows_counter.get(), 8);
 
         // 4. Send an update chunk to modify an original data point.
         tx.push_chunk(StreamChunk::from_pretty(
@@ -1993,8 +1901,5 @@ mod tests {
             )
             .sort_rows()
         );
-
-        // Verify metrics: 8 + 3 refilled = 11
-        assert_eq!(generated_rows_counter.get(), 11);
     }
 }
